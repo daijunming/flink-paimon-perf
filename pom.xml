@@ -1,0 +1,165 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.paimonperf</groupId>
+    <artifactId>paimon-perf-test</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+    <name>paimon-perf-test</name>
+    <description>Paimon 表性能测试工具链（离线 CDH YARN 环境，Java/Flink/StarRocks）</description>
+
+    <!--
+      聚合模块说明：
+      - 仅 Java 模块进入 <modules>（common / data-generator / metadata-collector / resource-collector）。
+      - 入湖作业不设 Java 模块、不打 jar，以 scripts/sql/ 下 .sql 脚本交付。
+      - analysis-sql/ 与 scripts/ 为资源目录（非 Maven 模块），随包搬运。
+    -->
+    <modules>
+        <module>common</module>
+        <module>data-generator</module>
+        <module>metadata-collector</module>
+        <module>resource-collector</module>
+    </modules>
+
+    <properties>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+        <!-- 目标运行环境为 JDK 8（CDH 集群运行时），用 JDK 8 工具链编译。 -->
+        <maven.compiler.source>8</maven.compiler.source>
+        <maven.compiler.target>8</maven.compiler.target>
+
+        <!-- 公共依赖版本（统一管理，子模块不再各自声明版本） -->
+        <kafka.clients.version>2.8.1</kafka.clients.version>
+        <jackson.version>2.15.4</jackson.version>
+        <slf4j.version>1.7.36</slf4j.version>
+
+        <!-- 元数据采集器：Paimon 读取元数据 + Hadoop 客户端（目标集群 Hadoop Catalog） -->
+        <paimon.version>1.1.1</paimon.version>
+        <hadoop.version>3.3.6</hadoop.version>
+
+        <!-- 测试依赖版本 -->
+        <junit.jupiter.version>5.10.2</junit.jupiter.version>
+        <jqwik.version>1.8.4</jqwik.version>
+
+        <!-- 插件版本 -->
+        <maven.compiler.plugin.version>3.8.1</maven.compiler.plugin.version>
+        <maven.surefire.plugin.version>3.0.0-M5</maven.surefire.plugin.version>
+        <maven.shade.plugin.version>3.2.4</maven.shade.plugin.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <!-- 模块内部依赖：common 被各采集器/生成器复用 -->
+            <dependency>
+                <groupId>com.paimonperf</groupId>
+                <artifactId>common</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+
+            <!-- Kafka 客户端（生成器写测试数据、采集器投递指标，Kafka 2.x） -->
+            <dependency>
+                <groupId>org.apache.kafka</groupId>
+                <artifactId>kafka-clients</artifactId>
+                <version>${kafka.clients.version}</version>
+            </dependency>
+
+            <!-- Jackson：指标信封 JSON 序列化，对齐既有指标管道 -->
+            <dependency>
+                <groupId>com.fasterxml.jackson.core</groupId>
+                <artifactId>jackson-databind</artifactId>
+                <version>${jackson.version}</version>
+            </dependency>
+
+            <!-- Paimon bundle：读取 Paimon 表元数据（系统表 $files/$snapshots） -->
+            <dependency>
+                <groupId>org.apache.paimon</groupId>
+                <artifactId>paimon-bundle</artifactId>
+                <version>${paimon.version}</version>
+            </dependency>
+
+            <!-- Hadoop 客户端：Hadoop Catalog 访问 HDFS 仓库 -->
+            <dependency>
+                <groupId>org.apache.hadoop</groupId>
+                <artifactId>hadoop-client</artifactId>
+                <version>${hadoop.version}</version>
+            </dependency>
+
+            <!-- 日志门面 -->
+            <dependency>
+                <groupId>org.slf4j</groupId>
+                <artifactId>slf4j-api</artifactId>
+                <version>${slf4j.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.slf4j</groupId>
+                <artifactId>slf4j-simple</artifactId>
+                <version>${slf4j.version}</version>
+            </dependency>
+
+            <!-- 测试：JUnit 5 平台 + jqwik 属性测试 -->
+            <dependency>
+                <groupId>org.junit.jupiter</groupId>
+                <artifactId>junit-jupiter</artifactId>
+                <version>${junit.jupiter.version}</version>
+                <scope>test</scope>
+            </dependency>
+            <dependency>
+                <groupId>net.jqwik</groupId>
+                <artifactId>jqwik</artifactId>
+                <version>${jqwik.version}</version>
+                <scope>test</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <!-- 测试依赖对所有子模块默认生效（jqwik + JUnit5） -->
+    <dependencies>
+        <dependency>
+            <groupId>net.jqwik</groupId>
+            <artifactId>jqwik</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <version>${maven.compiler.plugin.version}</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-surefire-plugin</artifactId>
+                    <version>${maven.surefire.plugin.version}</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-shade-plugin</artifactId>
+                    <version>${maven.shade.plugin.version}</version>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+            </plugin>
+            <!-- surefire 需开启对 jqwik(JUnit Platform) 的支持，已由 junit-platform 自动发现 -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>

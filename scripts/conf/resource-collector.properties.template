@@ -1,0 +1,17 @@
+# resource-collector.properties.template —— YARN/HDFS 资源采集器配置模板
+# 部署时复制为 resource-collector.properties 并填入真实环境值。
+
+# YARN ResourceManager 基地址（必填，如 http://rm-host:8088，不含路径）
+yarn.rm.url=${YARN_RM_URL}
+
+# HDFS NameNode 基地址（必填，如 http://nn-host:9870，不含路径）
+hdfs.nn.url=${HDFS_NN_URL}
+
+# Kafka 地址（必填，逗号分隔 broker 列表）
+kafka.bootstrap=${KAFKA_BOOTSTRAP_SERVERS}
+
+# 既有 metrics topic（必填，资源指标写入此 topic，与元数据采集器共用）
+kafka.metrics.topic=${KAFKA_METRICS_TOPIC}
+
+# 采集周期（秒），默认 30
+collect.interval.seconds=30
