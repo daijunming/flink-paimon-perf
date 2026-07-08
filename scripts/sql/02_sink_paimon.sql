@@ -1,18 +1,19 @@
--- 02_sink_paimon.sql —— 创建 Paimon 100 列主键宽表
--- 基于真实环境：paimon_obs.paimon_database.wide_table
--- 列名/类型严格对齐数据生成器 WideRecord.toJson() 的实际输出：
---   pk                     BIGINT          主键
---   c1_bigint..c20_bigint  BIGINT          20 列
---   c21_decimal..c40_decimal DECIMAL(20,4) 20 列（生成器写 JSON 数字，format 自动转 DECIMAL）
---   c41_string..c89_string STRING          49 列
---   c90_ts..c99_ts         BIGINT          10 列（生成器写 epoch 毫秒，故为 BIGINT 非 TIMESTAMP）
---   event_time             BIGINT          端到端延迟源时间锚（epoch 毫秒）
--- 合计 1+20+20+49+10 = 100 列业务字段 + event_time。
+-- 02_sink_paimon.sql —— 创建 Paimon 100 列主键宽表（对齐真实环境 DDL）
+-- 真实表：paimon_obs.paimon_database.wide_table
+-- 列：pk + c1..c20 BIGINT + c21..c40 DECIMAL(20,4) + c41..c89 STRING + c90..c99 BIGINT(epoch毫秒) + event_time BIGINT
+-- 合计 1+20+20+49+10 = 100 列业务字段 + event_time，主键 pk。
 --
--- merge-engine=deduplicate + sequence.field=event_time：高频更新时按 event_time 毫秒"新值胜出"，
--- 正是 LSM 主键去重所需语义（同一 pk 的较新 update 覆盖旧值）。
--- bucket 由阶段初始化脚本注入变量 ${BUCKET_NUM}（阶段1 探上限取大、阶段2 贴合目标）。
--- 提交方式：preflight 阶段一次性执行。
+-- 关键（对齐真实环境）：
+--   * bucket = 3（固定）：与写入作业 parallelism=3、Kafka 3 分区对齐。不再是 ${BUCKET_NUM} 变量，
+--     也不是旧脚本臆想的 63/15——Flink SQL 的 SET 变量注入本就不生效，且真实就是 3。
+--   * merge-engine=deduplicate + sequence.field=event_time：高频 update 时同一 pk 按 event_time 毫秒"新值胜出"。
+--   * changelog-producer=input，snapshot.num-retained.min=10。
+--   * 表上【不】放写入/compaction 调优选项。真实拓扑是"写入作业 write-only + 独立 compaction 作业"：
+--       - 写入侧参数（write-only=true / sink.parallelism / write-buffer-* 等）由 05_ingest_insert.sql 的
+--         INSERT `/*+ OPTIONS(...) */` 动态 hint 传入；
+--       - compaction 调优（compaction-trigger / merge-max-file-num 等）由独立 compaction 作业的
+--         --table_conf 传入（见 06_compaction_job.sh）。
+-- 提交方式：preflight 阶段一次性执行（与 01_catalog.sql 一起）。
 
 CREATE TABLE IF NOT EXISTS paimon_obs.paimon_database.wide_table (
   pk BIGINT,
@@ -40,18 +41,9 @@ CREATE TABLE IF NOT EXISTS paimon_obs.paimon_database.wide_table (
   event_time BIGINT,
   PRIMARY KEY (pk) NOT ENFORCED
 ) WITH (
-  'bucket' = '${BUCKET_NUM}',
+  'bucket' = '3',
   'merge-engine' = 'deduplicate',
   'sequence.field' = 'event_time',
   'changelog-producer' = 'input',
-  'snapshot.num-retained.min' = '10',
-
-  -- Compaction 内存控制：防止 rewrite 阶段 OOM
-  -- 1. 允许 write buffer 溢写磁盘（最重要，避免纯内存积压）
-  'write-buffer-spillable' = 'true',
-  -- 2. 减小 write buffer 大小（默认 256MB，降到 64MB 约束单 TM 内存占用）
-  'write-buffer-size' = '67108864',
-  -- 3. 限制单次 compaction 合并的文件数（默认 50，减少单次 rewrite 内存峰值）
-  'num-sorted-run.compaction-trigger' = '3',
-  'write.merge-max-file-num' = '6'
+  'snapshot.num-retained.min' = '10'
 );

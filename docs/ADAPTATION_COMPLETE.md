@@ -78,11 +78,11 @@
 
 ```bash
 # 配置文件：metadata-collector.properties
-warehouse=hdfs:///user/rtp_stream_usr/paimon
+warehouse=hdfs:///user/flink_user/paimon
 database=paimon_database
 table=wide_table
 collect.interval.seconds=60
-kafka.bootstrap=159.1.41.84:9092
+kafka.bootstrap=kafka-broker:9092
 kafka.metrics.topic=RDW_ODS_FLINK_METRICS_TOPIC
 
 # 启动
@@ -93,7 +93,7 @@ java -jar metadata-collector/target/metadata-collector.jar \
 ### 步骤2：验证Kafka消息
 
 ```bash
-kafka-console-consumer --bootstrap-server 159.1.41.84:9092 \
+kafka-console-consumer --bootstrap-server kafka-broker:9092 \
   --topic RDW_ODS_FLINK_METRICS_TOPIC \
   --from-beginning --max-messages 1
 ```

@@ -34,7 +34,7 @@ public final class KerberosAuthenticator {
     /**
      * 按需执行 Kerberos 登录并返回已认证的 Hadoop Configuration。
      *
-     * @param principal  Kerberos principal（如 rtp_usr@REALM.COM），为空则跳过认证
+     * @param principal  Kerberos principal（如 flink_user@REALM.COM），为空则跳过认证
      * @param keytab     keytab 文件路径，为空则跳过认证
      * @param krb5Conf   krb5.conf 路径，可为空（为空则用系统默认）
      * @return 已配置认证方式的 Hadoop Configuration；未启用 Kerberos 时返回默认 Configuration

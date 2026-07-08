@@ -186,7 +186,7 @@ java -jar metadata-collector/target/metadata-collector.jar \
   metadata-collector.properties
 
 # 2. 消费metrics topic
-kafka-console-consumer --bootstrap-server 159.1.41.84:9092 \
+kafka-console-consumer --bootstrap-server kafka-broker:9092 \
   --topic RDW_ODS_FLINK_METRICS_TOPIC \
   --from-beginning --max-messages 1
 

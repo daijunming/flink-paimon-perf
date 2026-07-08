@@ -1,22 +1,30 @@
--- 05_ingest_insert.sql —— 入湖 INSERT 主脚本
--- 基于真实环境：paimon_obs.paimon_database.wide_table
--- 从 Kafka source 直通写入 Paimon 主键宽表，event_time 原样透传（不重新赋值），
--- 供端到端延迟探针计算 now - MAX(event_time)。
--- 相同 pk 的 update 由主键表 merge-engine=deduplicate + sequence.field=event_time 语义去重。
+-- 05_ingest_insert.sql —— 入湖 INSERT 主脚本（write-only，对齐真实作业 DataStreamperf_paimon）
+-- 从 kafka_source 直通写入 wide_table，event_time 原样透传。
+-- 相同 pk 的 update 由主键表 merge-engine=deduplicate + sequence.field=event_time 去重。
 --
--- 提交前置：本脚本依赖 kafka_source（临时表，会话级）与 paimon_cat.perf.wide_table。
--- 推荐提交方式（同一 sql-client 会话内按序执行）：
---   flink sql-client \
---     -i scripts/sql/init_${PHASE}.sql \      # 阶段参数 SET + 变量
---     -i scripts/sql/03_source_kafka.sql \    # 建 Kafka source 临时表
---     -f scripts/sql/05_ingest_insert.sql     # 执行入湖 INSERT
--- （01_catalog.sql / 02_sink_paimon.sql 已在 preflight 阶段一次性建好）
---
--- 降低主键表写入开销：关闭 upsert 物化、丢弃 not-null 违例（测试数据无 null 主键）。
-SET 'table.exec.sink.upsert-materialize' = 'NONE';
-SET 'table.exec.sink.not-null-enforcer' = 'DROP';
+-- 关键（对齐真实环境）：
+--   * 写入参数走 INSERT 的 `/*+ OPTIONS(...) */` 动态 hint（不放在建表 WITH）：
+--       - write-only=true：写入作业只写不合并——真实算子名就是 `Writer(write-only) : wide_table`，
+--         合并由独立 compaction 作业完成（见 06_compaction_job.sh）。
+--       - sink.parallelism=3、write-buffer-spillable、write-buffer-size、sink.use-managed-memory-allocator、
+--         parquet.enable.dictionary=false、read.batch-size：写入侧内存/格式调优。
+--       - num-sorted-run.compaction-trigger / write.merge-max-file-num 在 write-only 下对本作业不生效
+--         （合并在 compaction 作业），此处保留仅为与真实作业参数一致。
+--   * 运行参数（parallelism.default=3、checkpoint、mini-batch、not-null-enforcer=ERROR 等）不在本 SQL 里 SET，
+--     而在平台作业的运行参数 JSON（见 job-run-params.json）——这才是真实提交形态。
 
 INSERT INTO paimon_obs.paimon_database.wide_table
+/*+ OPTIONS(
+  'write-only' = 'true',
+  'sink.parallelism' = '3',
+  'sink.use-managed-memory-allocator' = 'true',
+  'write-buffer-spillable' = 'true',
+  'write-buffer-size' = '64 m',
+  'num-sorted-run.compaction-trigger' = '3',
+  'write.merge-max-file-num' = '6',
+  'parquet.enable.dictionary' = 'false',
+  'read.batch-size' = '512'
+) */
 SELECT
   pk,
   c1_bigint, c2_bigint, c3_bigint, c4_bigint, c5_bigint,

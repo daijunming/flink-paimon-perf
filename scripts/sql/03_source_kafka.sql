@@ -1,9 +1,11 @@
--- 03_source_kafka.sql —— 创建 Kafka source 临时表（CDC 格式）
--- 列名/类型与 02_sink_paimon.sql 及生成器 WideRecord.toJson() 三处严格对齐。
--- format=ogg-json：生成器产出 OGG CDC 格式 JSON（op_type=I/U/D），支持 INSERT/UPDATE/DELETE 三种操作。
--- 不设 WATERMARK：入湖为直通 INSERT，不做窗口/事件时间运算；端到端延迟由探针查 MAX(event_time) 计算。
--- topic / bootstrap.servers / scan.startup.mode 由运行环境与阶段脚本注入，仓库内不填真值。
--- 三级命名：平台存在多个catalog/database，所有表必须显式指定避免冲突。
+-- 03_source_kafka.sql —— 创建 Kafka source 临时表（对齐真实环境）
+-- 列与 02_sink_paimon.sql / 生成器 WideRecord.toJson() 三处一致（100 列 + event_time）。
+-- format=ogg-json：源为 OGG CDC（op_type=I/U/D），支持 INSERT/UPDATE/DELETE。
+-- 不设 WATERMARK：入湖为直通 INSERT，不做窗口/事件时间运算。
+-- 三段式命名：临时表建在 default_catalog.default_database。
+-- 真实连接参数（2026-07-07 核对，与 DataStreamperf_paimon 作业一致）：
+--   topic=src_pref_paimon, bootstrap=${KAFKA_BOOTSTRAP_SERVERS}, group.id=job_pref_paimon,
+--   scan.startup.mode=earliest-offset（吃满堆积；如需从最新开始改 latest-offset）。
 
 CREATE TEMPORARY TABLE default_catalog.default_database.kafka_source (
   pk BIGINT,
@@ -31,9 +33,9 @@ CREATE TEMPORARY TABLE default_catalog.default_database.kafka_source (
   event_time BIGINT
 ) WITH (
   'connector' = 'kafka',
-  'topic' = '${KAFKA_TOPIC}',
+  'topic' = 'src_pref_paimon',
   'properties.bootstrap.servers' = '${KAFKA_BOOTSTRAP_SERVERS}',
-  'properties.group.id' = 'job_paimon_wide_ingest',
-  'scan.startup.mode' = '${SCAN_STARTUP_MODE}',
+  'properties.group.id' = 'job_pref_paimon',
+  'scan.startup.mode' = 'earliest-offset',
   'format' = 'ogg-json'
 );

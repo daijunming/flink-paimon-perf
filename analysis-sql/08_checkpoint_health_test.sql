@@ -1,75 +1,69 @@
 -- 08_checkpoint_health_test.sql —— 快照推进健康度验证
--- 构造三个时段的快照数据：正常推进 → 停滞 → 恢复，验证 STALL 检测正确。
+-- 自包含测试：用临时表构造"正常→停滞→恢复"的快照序列，复现 checkpoint_health 的 LAG 逻辑，
+-- 断言停滞时段（snapshot_id 增量=0）被标记为 STALL。不触碰真实分区表。
 
--- 清理测试数据
-DELETE FROM RDW_ODS_FLINK_METRICS WHERE job_name = 'ckpt_health_test';
+DROP TABLE IF EXISTS test_ckpt_input;
 
--- 插入测试数据（对齐真实表12字段）
--- 场景：t0 快照=100, t1 快照=101（正常+1）, t2 快照=101（停滞）, t3 快照=103（恢复）
-INSERT INTO RDW_ODS_FLINK_METRICS VALUES
--- t0: 2024-01-01 00:00:00, snapshot_id=100, commit_time=00:00:00
-('2024-01-01', 'PAIMON_METADATA_ckpt_health_test_paimon.snapshot.id_1704067200000',
- 'ckpt_health_test', 'paimon_table_mornit', '', '', '', '',
- 'paimon.snapshot.id', 'PAIMON_METADATA', '100.0', '1704067200000'),
-('2024-01-01', 'PAIMON_METADATA_ckpt_health_test_paimon.snapshot.time.millis_1704067200000',
- 'ckpt_health_test', 'paimon_table_mornit', '', '', '', '',
- 'paimon.snapshot.time.millis', 'PAIMON_METADATA', '1704067200000.0', '1704067200000'),
+-- 模拟 checkpoint_health 内层子查询的输出（每分钟一行的快照号/提交时间）
+CREATE TABLE test_ckpt_input (
+  job_name VARCHAR(50),
+  time_bucket_minute VARCHAR(20),
+  snapshot_id DOUBLE,
+  snapshot_commit_time_millis DOUBLE
+) DUPLICATE KEY(job_name, time_bucket_minute)
+DISTRIBUTED BY HASH(job_name) BUCKETS 1;
 
--- t1: 00:01:00, snapshot_id=101（正常推进 +1），commit_time=00:01:00（间隔60秒）
-('2024-01-01', 'PAIMON_METADATA_ckpt_health_test_paimon.snapshot.id_1704067260000',
- 'ckpt_health_test', 'paimon_table_mornit', '', '', '', '',
- 'paimon.snapshot.id', 'PAIMON_METADATA', '101.0', '1704067260000'),
-('2024-01-01', 'PAIMON_METADATA_ckpt_health_test_paimon.snapshot.time.millis_1704067260000',
- 'ckpt_health_test', 'paimon_table_mornit', '', '', '', '',
- 'paimon.snapshot.time.millis', 'PAIMON_METADATA', '1704067260000.0', '1704067260000'),
+-- 场景：t0=100 → t1=101(+1,间隔60s) → t2=101(停滞,delta=0) → t3=103(恢复,+2)
+INSERT INTO test_ckpt_input VALUES
+  ('wide_table', '2000-01-01 00:00:00', 100, 946684800000),
+  ('wide_table', '2000-01-01 00:01:00', 101, 946684860000),
+  ('wide_table', '2000-01-01 00:02:00', 101, 946684860000),
+  ('wide_table', '2000-01-01 00:03:00', 103, 946684980000);
 
--- t2: 00:02:00, snapshot_id=101（停滞，增量=0）
-('2024-01-01', 'PAIMON_METADATA_ckpt_health_test_paimon.snapshot.id_1704067320000',
- 'ckpt_health_test', 'paimon_table_mornit', '', '', '', '',
- 'paimon.snapshot.id', 'PAIMON_METADATA', '101.0', '1704067320000'),
-('2024-01-01', 'PAIMON_METADATA_ckpt_health_test_paimon.snapshot.time.millis_1704067320000',
- 'ckpt_health_test', 'paimon_table_mornit', '', '', '', '',
- 'paimon.snapshot.time.millis', 'PAIMON_METADATA', '1704067260000.0', '1704067320000'),
-
--- t3: 00:03:00, snapshot_id=103（恢复推进 +2）
-('2024-01-01', 'PAIMON_METADATA_ckpt_health_test_paimon.snapshot.id_1704067380000',
- 'ckpt_health_test', 'paimon_table_mornit', '', '', '', '',
- 'paimon.snapshot.id', 'PAIMON_METADATA', '103.0', '1704067380000'),
-('2024-01-01', 'PAIMON_METADATA_ckpt_health_test_paimon.snapshot.time.millis_1704067380000',
- 'ckpt_health_test', 'paimon_table_mornit', '', '', '', '',
- 'paimon.snapshot.time.millis', 'PAIMON_METADATA', '1704067380000.0', '1704067380000');
-
--- 验证1：快照推进明细（用内联子查询复现 checkpoint_health 逻辑，限定测试表）
+-- 复现 checkpoint_health + checkpoint_stall_alert 的判定逻辑
 SELECT
   job_name,
   time_bucket_minute,
   snapshot_id,
-  snapshot_id - LAG(snapshot_id) OVER (
-      PARTITION BY job_name ORDER BY time_bucket_minute) AS snapshot_id_delta,
-  (snapshot_commit_time_millis - LAG(snapshot_commit_time_millis) OVER (
-      PARTITION BY job_name ORDER BY time_bucket_minute)) / 1000.0 AS commit_interval_sec
+  snapshot_id_delta,
+  commit_interval_sec,
+  CASE
+    WHEN snapshot_id_delta = 0 THEN 'STALL'
+    WHEN commit_interval_sec > 180 THEN 'SLOW'
+    ELSE 'OK'
+  END AS health_status
 FROM (
   SELECT
     job_name,
-    FROM_UNIXTIME(CAST(metric_ts AS BIGINT) / 1000, '%Y-%m-%d %H:%i:00') AS time_bucket_minute,
-    MAX(CASE WHEN metric_name = 'paimon.snapshot.id' THEN CAST(metric_value AS DOUBLE) END) AS snapshot_id,
-    MAX(CASE WHEN metric_name = 'paimon.snapshot.time.millis' THEN CAST(metric_value AS DOUBLE) END) AS snapshot_commit_time_millis
-  FROM RDW_ODS_FLINK_METRICS
-  WHERE metric_type = 'PAIMON_METADATA'
-    AND job_name = 'ckpt_health_test'
-    AND metric_name IN ('paimon.snapshot.id', 'paimon.snapshot.time.millis')
-  GROUP BY job_name, FROM_UNIXTIME(CAST(metric_ts AS BIGINT) / 1000, '%Y-%m-%d %H:%i:00')
+    time_bucket_minute,
+    snapshot_id,
+    snapshot_id - LAG(snapshot_id) OVER (
+        PARTITION BY job_name ORDER BY time_bucket_minute) AS snapshot_id_delta,
+    (snapshot_commit_time_millis - LAG(snapshot_commit_time_millis) OVER (
+        PARTITION BY job_name ORDER BY time_bucket_minute)) / 1000.0 AS commit_interval_sec
+  FROM test_ckpt_input
 ) t
 ORDER BY time_bucket_minute;
 
--- 预期输出（4行）：
--- t0 00:00: snapshot_id=100, delta=NULL,  interval=NULL
--- t1 00:01: snapshot_id=101, delta=1,     interval=60   （正常）
--- t2 00:02: snapshot_id=101, delta=0,     interval=0    （STALL：快照停滞）
--- t3 00:03: snapshot_id=103, delta=2,     interval=120  （恢复）
+-- 预期（4行）：
+-- t0 00:00: delta=NULL, interval=NULL, OK（首行无前值）
+-- t1 00:01: delta=1,    interval=60,   OK
+-- t2 00:02: delta=0,    interval=0,    STALL（快照停滞）
+-- t3 00:03: delta=2,    interval=120,  OK
 
--- 断言：t2 的 snapshot_id_delta=0 → 应被 checkpoint_stall_alert 标记为 STALL
--- 断言：snapshot_id 整体单调不减（100→101→101→103），符合快照演进语义
+-- 断言：恰好 1 个时段被判为 STALL（增量=0）
+SELECT
+  '断言: 停滞检测（delta=0 → STALL）' AS test_description,
+  SUM(CASE WHEN snapshot_id_delta = 0 THEN 1 ELSE 0 END) AS stall_count,
+  CASE WHEN SUM(CASE WHEN snapshot_id_delta = 0 THEN 1 ELSE 0 END) = 1
+       THEN 'PASS' ELSE 'FAIL' END AS result
+FROM (
+  SELECT snapshot_id - LAG(snapshot_id) OVER (
+           PARTITION BY job_name ORDER BY time_bucket_minute) AS snapshot_id_delta
+  FROM test_ckpt_input
+) t;
 
--- 清理测试数据
-DELETE FROM RDW_ODS_FLINK_METRICS WHERE job_name = 'ckpt_health_test';
+-- 清理
+DROP TABLE IF EXISTS test_ckpt_input;
+
+-- 预期输出：断言 result = PASS

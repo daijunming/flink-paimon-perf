@@ -1,83 +1,51 @@
-# scripts/sql（入湖 Flink SQL 脚本目录）
+# scripts/sql（入湖作业交付：SQL body + 运行参数 + 独立 compaction + 流式读作业）
 
-入湖作业（组件 b）的交付形态：独立 `.sql` 脚本，用 `flink sql-client -i/-f` 提交，不打 jar。
+对齐真实环境（2026-07-07 核对）。真实拓扑是**平台作业**,不是 sql-client 手工 `-i/-f`:
 
-## 脚本清单
+- **写入作业**（`DataStreamperf_paimon`,STREAMING）：SQL body（建源 + INSERT）+ 运行参数 JSON。写入 **write-only**（只写不合并）。
+- **Compaction 作业**（`compaction_job`）：独立的 Paimon Flink Action `compact`,负责合并。
+- **读取作业（流式）**：`07_streaming_read.sql`（流式读取 changelog）与 `08_streaming_agg.sql`（流式全表持续聚合）,叠加在写入作业上观测读写并发。真实需要的是**流式读取**与**流式聚合**,不是点查（Lookup Join）或批 OLAP 扫描。
 
-| 文件 | 内容 | 提交方式 |
-|------|------|----------|
-| `01_catalog.sql` | 创建 Paimon Hadoop Catalog + database | `-f`（preflight 一次性） |
-| `02_sink_paimon.sql` | 创建 Paimon 100 列主键宽表（+ event_time，deduplicate 主键去重） | `-f`（preflight 一次性） |
-| `03_source_kafka.sql` | Kafka source 临时表（100 列 + event_time，**format=canal-json 支持 CDC DELETE**） | `-i`（入湖会话内建临时表） |
-| `05_ingest_insert.sql` | 入湖 INSERT（透传全部列 + event_time，**支持 INSERT/UPDATE/DELETE**） | `-f` 主脚本 |
-| `06_point_lookup.sql` | **Flink 点查作业**（Lookup Join 模拟实时特征查询，Requirements 7.3） | `-f`（独立作业，可选） |
-| `07_olap_scan.sql` | **OLAP 全表扫描作业**（批读聚合模拟 BI 报表，Requirements 7.3） | `-f`（独立作业，可选） |
-| `init_phase1.sql` | 阶段1 极限压测参数（SET + 变量） | `-i` |
-| `init_phase2.sql` | 阶段2 生产模拟参数（SET + 变量） | `-i` |
+## 文件清单
 
-> **06/07 为读取作业**，验证 Requirements 7.3（读取与查询性能）；可在阶段2与入湖作业并发运行，观测读写冲突下的性能表现。
+| 文件 | 内容 | 角色 |
+|------|------|------|
+| `01_catalog.sql` | 建 Paimon catalog `paimon_obs` + database `paimon_database` | preflight（一次性） |
+| `02_sink_paimon.sql` | 建 `wide_table`（100 列 + event_time,**bucket=3**,deduplicate 主键去重）；写入/compaction 选项**不**放表上 | preflight（一次性） |
+| `03_source_kafka.sql` | Kafka source 临时表（topic `src_pref_paimon`,ogg-json） | 写入作业 SQL body |
+| `05_ingest_insert.sql` | `INSERT /*+ OPTIONS('write-only'='true', ...) */ SELECT … FROM kafka_source` | 写入作业 SQL body |
+| `job-run-params.json` | 写入作业真实运行参数（parallelism=3、checkpoint 3min、rocksdb、mini-batch、not-null-enforcer=ERROR 等） | 写入作业运行参数 |
+| `06_compaction_job.sh` | 独立 compaction 作业（`paimon-flink-action compact`,`job_name=compaction_job`） | 独立作业 |
+| `07_streaming_read.sql` | 流式读取 `wide_table` changelog（blackhole sink,测流读吞吐/延迟） | 读作业（流式,可选） |
+| `08_streaming_agg.sql` | 流式全表持续聚合 COUNT/AVG/SUM/MAX（print sink） | 读作业（流式,可选） |
 
-## 提交方式
+## 提交流程
 
-建表（一次性，preflight 阶段）：
+1. **preflight（一次性建表）**：执行 `01_catalog.sql`、`02_sink_paimon.sql`（catalog + database + wide_table）。
+2. **写入作业**：以 `03_source_kafka.sql` + `05_ingest_insert.sql` 为 SQL body,配 `job-run-params.json` 的运行参数,作为平台 STREAMING 作业提交（作业名 `DataStreamperf_paimon`）。
+3. **compaction 作业**：`bash 06_compaction_job.sh` 提交独立 compaction（作业名 `compaction_job`,流模式持续合并）。
+4. **读作业（可选）**：`07_streaming_read.sql` / `08_streaming_agg.sql` 以流模式提交,与写入作业并发运行,观测读写相互影响。
 
-```bash
-flink sql-client -f scripts/sql/01_catalog.sql
-flink sql-client -f scripts/sql/02_sink_paimon.sql
-```
+## 关键设计（对齐真实环境）
 
-> 注意：`02_sink_paimon.sql` 含变量 `${BUCKET_NUM}`，建表时需先经阶段脚本注入，或在 preflight 用相应阶段的 bucket 值执行。
+1. **列/类型**：`pk` + `c1..c20` BIGINT + `c21..c40` DECIMAL(20,4) + `c41..c89` STRING + `c90..c99` BIGINT（epoch 毫秒） + `event_time` BIGINT。时间列用 BIGINT（生成器写毫秒数字,非 TIMESTAMP）。
+2. **bucket=3（固定）**：与写入 parallelism=3、Kafka 3 分区对齐。不是变量 `${BUCKET_NUM}`（Flink SQL 的 `SET` 变量注入本就不生效）,也不是旧脚本的 63/15。
+3. **write-only + 独立 compaction**：写入作业只写不合并（真实算子名 `Writer(write-only) : wide_table` 即为证）,合并交给 `06_compaction_job.sh`。`write-only=true` 等写入参数经 INSERT 的 `/*+ OPTIONS() */` 动态 hint 传入,**不**写在建表 WITH。
+4. **merge-engine=deduplicate + sequence.field=event_time**：高频 update 时同一 pk 按 event_time 毫秒"新值胜出";`changelog-producer=input`（流式读作业据此消费变更流）。
+5. **ogg-json**：源为 OGG CDC（op_type=I/U/D）,支持 INSERT/UPDATE/DELETE。
+6. **运行参数在 JSON,不在 SQL 里 SET**：`parallelism`/`checkpointing`/`table.exec.*` 等属于平台作业配置。其中 `not-null-enforcer=ERROR`（旧脚本 SET 的 DROP 已弃用,以运行参数为准）。
 
-启动入湖（按阶段）：
+## 脱敏（提交到远程）
 
-```bash
-flink sql-client \
-  -i scripts/sql/init_${PHASE}.sql \    # 阶段参数 + 变量（BUCKET_NUM / SCAN_STARTUP_MODE）
-  -i scripts/sql/03_source_kafka.sql \  # 建 Kafka source 临时表（会话级）
-  -f scripts/sql/05_ingest_insert.sql   # 执行入湖 INSERT
-```
+- **敏感基础设施用占位符,部署时填**：Kafka 地址 `${KAFKA_BOOTSTRAP_SERVERS}`（`03`）、HDFS 仓库路径 `${PAIMON_WAREHOUSE}`（`01`、`06`）;`job-run-params.json` 的 `sqlPath`/`modelTablePath` 已用 `flink_user` / `<task-uuid>` 脱敏。
+- **逻辑值保留真实**：catalog `paimon_obs`、database `paimon_database`、table `wide_table`、topic `src_pref_paimon`、group `job_pref_paimon`、`bucket=3`（均非敏感）。
 
-`PHASE` 取 `phase1` 或 `phase2`，由编排脚本（任务 9）的环境变量决定。
+## 相比旧交付改了什么
 
-## 占位符（运行环境注入，仓库内不填真值）
+- `06_point_lookup.sql`（点查 Lookup Join）/ `07_olap_scan.sql`（批 OLAP 扫描）：形态不符,已用流式 `07_streaming_read.sql` / `08_streaming_agg.sql` 取代。
+- `init_phase1.sql` / `init_phase2.sql`：`SET 'BUCKET_NUM'=…` 变量注入在 Flink SQL 不生效;且 bucket 已固定=3、并发/checkpoint 等参数进了 `job-run-params.json`。删除。
+- 建表 WITH 里的 write-buffer / compaction 选项：移到 INSERT hint（写入侧）与 compaction 作业的 `--table_conf`（合并侧）。
 
-| 占位符 | 含义 | 注入来源 |
-|--------|------|----------|
-| `${PAIMON_WAREHOUSE}` | Paimon 仓库 HDFS 路径 | 运行环境 |
-| `${KAFKA_BOOTSTRAP_SERVERS}` | Kafka 地址 | 运行环境 |
-| `${KAFKA_TOPIC}` | 测试数据 topic | 运行环境 |
-| `${BUCKET_NUM}` | Paimon 表 bucket 数 | 阶段脚本（phase1=64 / phase2=16） |
-| `${SCAN_STARTUP_MODE}` | Kafka 起始位移 | 阶段脚本（phase1=earliest / phase2=latest） |
+## 待定
 
-## 关键设计决策（与设计文档的对齐说明）
-
-1. **列名/类型严格对齐数据生成器实际输出**（`WideRecord.toJson()`）：
-   - `c1_bigint..c20_bigint`（BIGINT）、`c21_decimal..c40_decimal`（DECIMAL(20,4)）、
-     `c41_string..c89_string`（STRING）、`c90_ts..c99_ts`（BIGINT）。
-   - **时间列与 `event_time` 用 BIGINT（epoch 毫秒），非 TIMESTAMP**——生成器用 `getTime()`
-     写毫秒数字，若建成 TIMESTAMP 则 JSON format 解析会失败。这是对设计文档示意（TIMESTAMP）的
-     有意偏离，以匹配生成器真实输出。
-
-2. **OGG-JSON 格式支持 DELETE**（Requirements 7.2）：
-   - 生成器产出 OGG-JSON 格式：`{"op_type":"I/U/D", "pk":123, ...}`
-   - Kafka source 用 `format=ogg-json` 自动解析 op_type 字段：
-     - `op_type=I` → INSERT
-     - `op_type=U` → UPDATE（主键存在则覆盖）
-     - `op_type=D` → DELETE（主键存在则删除）
-   - DELETE 记录只含 pk + op_type + event_time，无业务列数据（节省带宽）
-   - 配置项 `delete.ratio`（默认 0.1）控制 DELETE 占比，与 `update.ratio` 之和不超过 1.0
-
-3. **去掉 WATERMARK**：入湖是直通 INSERT，不做窗口/事件时间运算，watermark 无用武之地。
-   端到端延迟由探针查 `MAX(event_time)` 算 `now - max`（BIGINT 毫秒直接相减），不依赖 watermark。
-
-4. **merge-engine=deduplicate + sequence.field=event_time**：高频更新时同一 pk 按 event_time
-   毫秒"新值胜出"，即 LSM 主键去重语义；`changelog-producer=input` 产出变更日志供下游观测。
-
-5. **降写入开销**：`upsert-materialize=NONE` + `not-null-enforcer=DROP`（参考既有 PK 入湖脚本经验）。
-
-6. **读取作业覆盖 Requirements 7.3**：
-   - **06_point_lookup.sql**：Flink Lookup Join 模拟实时特征查询（如风控/推荐点查 pk），
-     验证主键表点查延迟、并发读写冲突下的查询性能
-   - **07_olap_scan.sql**：批读全表聚合模拟 BI 报表（如每 5 分钟统计总记录数/avg/sum），
-     验证扫描吞吐、Compaction 对读放大的影响
-   - 两者可在阶段2与入湖作业**并发运行**，观测读写相互影响（吞吐下降/延迟上升）
+- **阶段化（6.2 三阶段方案）**：真实作业当前是单一配置（bucket=3、parallelism=3、checkpoint 3min）。若三阶段要变 bucket / 并发 / 负载,方案定了再落成对应的参数集（多份 `job-run-params.json` 或 compaction 参数）。

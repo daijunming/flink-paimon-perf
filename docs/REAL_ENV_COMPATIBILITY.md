@@ -14,7 +14,7 @@ CREATE TEMPORARY TABLE default_catalog.rtp_data.src_pk_cdc (
 ) WITH (
   'connector' = 'kafka',
   'topic' = 'src_pk_cdc',
-  'properties.bootstrap.servers' = '159.1.41.84:9092',
+  'properties.bootstrap.servers' = 'kafka-broker:9092',
   'properties.group.id' = 'job_paimon_pk_sink',
   'scan.startup.mode' = 'earliest-offset',
   'value.format' = 'ogg-json'  -- ✅ 与我们的格式一致
@@ -91,7 +91,7 @@ CREATE TEMPORARY TABLE kafka_source (
 ```sql
 CREATE CATALOG paimon_obs WITH (
   'type' = 'paimon',
-  'warehouse' = 'hdfs:///user/rtp_stream_usr/paimon'
+  'warehouse' = 'hdfs:///user/flink_user/paimon'
 );
 
 CREATE DATABASE IF NOT EXISTS paimon_obs.paimon_database;
@@ -104,7 +104,7 @@ CREATE TABLE IF NOT EXISTS paimon_obs.paimon_database.pk_state_paimon (...);
 | 文件 | 原配置 | 新配置（真实环境） |
 |------|--------|-------------------|
 | **01_catalog.sql** | `paimon_cat` catalog | ✅ `paimon_obs` catalog |
-|  | `${PAIMON_WAREHOUSE}` 占位符 | ✅ `hdfs:///user/rtp_stream_usr/paimon` 硬编码 |
+|  | `${PAIMON_WAREHOUSE}` 占位符 | ✅ `hdfs:///user/flink_user/paimon` 硬编码 |
 |  | `paimon_cat.perf` database | ✅ `paimon_obs.paimon_database` |
 | **02_sink_paimon.sql** | `paimon_cat.perf.wide_table` | ✅ `paimon_obs.paimon_database.wide_table` |
 | **05_ingest_insert.sql** | `INSERT INTO paimon_cat.perf.wide_table` | ✅ `INSERT INTO paimon_obs.paimon_database.wide_table` |
@@ -126,7 +126,7 @@ delete.ratio=0.1
 rate.limit.enabled=false
 
 # 你的真实Kafka配置
-kafka.bootstrap=159.1.41.84:9092
+kafka.bootstrap=kafka-broker:9092
 kafka.topic=test_wide_table_ogg  # 新topic，避免污染现有数据
 EOF
 ```
@@ -144,7 +144,7 @@ java -jar data-generator.jar test-real-env.properties
 ```bash
 # 查看生成的OGG-JSON消息
 kafka-console-consumer \
-  --bootstrap-server 159.1.41.84:9092 \
+  --bootstrap-server kafka-broker:9092 \
   --topic test_wide_table_ogg \
   --from-beginning \
   --max-messages 5
@@ -180,7 +180,7 @@ flink sql-client -e "SHOW TABLES IN paimon_obs.paimon_database;"
 # 修改03_source_kafka.sql的占位符（临时测试）
 cat scripts/sql/03_source_kafka.sql | \
   sed "s/\${KAFKA_TOPIC}/test_wide_table_ogg/g" | \
-  sed "s/\${KAFKA_BOOTSTRAP_SERVERS}/159.1.41.84:9092/g" | \
+  sed "s/\${KAFKA_BOOTSTRAP_SERVERS}/kafka-broker:9092/g" | \
   sed "s/\${SCAN_STARTUP_MODE}/earliest-offset/g" \
   > /tmp/03_source_kafka_test.sql
 
@@ -272,7 +272,7 @@ FROM paimon_obs.paimon_database.wide_table;
 
 ```bash
 # 前提：metadata-collector已启动并产出延迟指标到metrics topic
-kafka-console-consumer --bootstrap-server 159.1.41.84:9092 \
+kafka-console-consumer --bootstrap-server kafka-broker:9092 \
   --topic metrics_topic \
   --from-beginning | grep "ingest.e2e_latency_ms"
 
@@ -292,17 +292,17 @@ kafka-console-consumer --bootstrap-server 159.1.41.84:9092 \
 
 ```bash
 # 查看Paimon表目录结构
-hdfs dfs -ls hdfs:///user/rtp_stream_usr/paimon/paimon_database.db/wide_table/
+hdfs dfs -ls hdfs:///user/flink_user/paimon/paimon_database.db/wide_table/
 
 # 预期输出：
-drwxr-xr-x   - rtp_stream_usr supergroup  0 2024-01-01 12:00 bucket-0
-drwxr-xr-x   - rtp_stream_usr supergroup  0 2024-01-01 12:00 bucket-1
+drwxr-xr-x   - flink_user supergroup  0 2024-01-01 12:00 bucket-0
+drwxr-xr-x   - flink_user supergroup  0 2024-01-01 12:00 bucket-1
 ...
-drwxr-xr-x   - rtp_stream_usr supergroup  0 2024-01-01 12:00 manifest
-drwxr-xr-x   - rtp_stream_usr supergroup  0 2024-01-01 12:00 snapshot
+drwxr-xr-x   - flink_user supergroup  0 2024-01-01 12:00 manifest
+drwxr-xr-x   - flink_user supergroup  0 2024-01-01 12:00 snapshot
 
 # 查看snapshot数量（每次checkpoint产生一个snapshot）
-hdfs dfs -ls hdfs:///user/rtp_stream_usr/paimon/paimon_database.db/wide_table/snapshot/ | wc -l
+hdfs dfs -ls hdfs:///user/flink_user/paimon/paimon_database.db/wide_table/snapshot/ | wc -l
 
 # 预期：snapshot数量持续增长（说明checkpoint正常进行）
 
@@ -396,10 +396,10 @@ SELECT COUNT(*) AS total_records FROM paimon_obs.paimon_database.wide_table;
 # Compaction时真正删除物理数据
 
 # 查看文件数变化（DELETE触发Compaction）
-hdfs dfs -ls hdfs:///user/rtp_stream_usr/paimon/paimon_database.db/wide_table/bucket-0/ | wc -l
+hdfs dfs -ls hdfs:///user/flink_user/paimon/paimon_database.db/wide_table/bucket-0/ | wc -l
 
 # 观察Compaction频率（metadata-collector采集的指标）
-kafka-console-consumer --bootstrap-server 159.1.41.84:9092 \
+kafka-console-consumer --bootstrap-server kafka-broker:9092 \
   --topic metrics_topic | grep "paimon.last.commit.kind"
 
 # 预期输出：
@@ -424,8 +424,8 @@ kafka-console-consumer --bootstrap-server 159.1.41.84:9092 \
 ### 前置准备
 
 **已有资源**：
-- ✅ Kafka集群：`159.1.41.84:9092`
-- ✅ HDFS Paimon仓库：`hdfs:///user/rtp_stream_usr/paimon`
+- ✅ Kafka集群：`kafka-broker:9092`
+- ✅ HDFS Paimon仓库：`hdfs:///user/flink_user/paimon`
 - ✅ Paimon catalog：`paimon_obs`
 - ✅ Paimon database：`paimon_database`
 
@@ -446,7 +446,7 @@ account.total=30000000
 update.ratio=0.4
 delete.ratio=0.1
 rate.limit.enabled=false
-kafka.bootstrap=159.1.41.84:9092
+kafka.bootstrap=kafka-broker:9092
 kafka.topic=test_wide_table
 EOF
 
@@ -455,7 +455,7 @@ java -jar data-generator/target/data-generator.jar data-generator-phase1.propert
 # 3. 启动入湖作业（阶段1参数：parallelism=32, bucket=64, earliest-offset）
 # 需先用sed替换占位符
 export KAFKA_TOPIC=test_wide_table
-export KAFKA_BOOTSTRAP_SERVERS=159.1.41.84:9092
+export KAFKA_BOOTSTRAP_SERVERS=kafka-broker:9092
 export SCAN_STARTUP_MODE=earliest-offset
 export BUCKET_NUM=64
 
@@ -477,10 +477,10 @@ flink sql-client \
 
 # 4. 启动采集器（需修改配置文件为真实环境）
 # metadata-collector.properties:
-#   warehouse=hdfs:///user/rtp_stream_usr/paimon
+#   warehouse=hdfs:///user/flink_user/paimon
 #   database=paimon_database
 #   table=wide_table
-#   kafka.bootstrap=159.1.41.84:9092
+#   kafka.bootstrap=kafka-broker:9092
 
 java -jar metadata-collector/target/metadata-collector.jar metadata-collector.properties &
 java -jar resource-collector/target/resource-collector.jar resource-collector.properties &
@@ -496,7 +496,7 @@ update.ratio=0.4
 delete.ratio=0.1
 rate.limit.enabled=true
 rate.limit.rps=20000
-kafka.bootstrap=159.1.41.84:9092
+kafka.bootstrap=kafka-broker:9092
 kafka.topic=test_wide_table
 EOF
 
@@ -525,8 +525,8 @@ flink sql-client \
 |----|---------------|-------------------|
 | **Catalog名** | `paimon_cat` | ✅ `paimon_obs` |
 | **Database名** | `perf` | ✅ `paimon_database` |
-| **Warehouse路径** | `${PAIMON_WAREHOUSE}` 占位符 | ✅ `hdfs:///user/rtp_stream_usr/paimon` 硬编码 |
-| **Kafka地址** | `${KAFKA_BOOTSTRAP_SERVERS}` 占位符 | 需替换为 `159.1.41.84:9092` |
+| **Warehouse路径** | `${PAIMON_WAREHOUSE}` 占位符 | ✅ `hdfs:///user/flink_user/paimon` 硬编码 |
+| **Kafka地址** | `${KAFKA_BOOTSTRAP_SERVERS}` 占位符 | 需替换为 `kafka-broker:9092` |
 | **OGG-JSON format** | `format = 'ogg-json'` | ✅ 与你的 `value.format = 'ogg-json'` 完全兼容 |
 | **三级表名** | `catalog.database.table` | ✅ 已全部更新为 `paimon_obs.paimon_database.wide_table` |
 

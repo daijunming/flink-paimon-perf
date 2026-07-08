@@ -1,84 +1,47 @@
 -- 01_metrics_view_test.sql —— 时段分桶逻辑验证（Property 10）
--- 验证 metrics_view 的字段映射和时段分桶正确性
+-- 自包含测试：用临时输入表复现 metrics_view 的字段映射与分钟分桶表达式，断言分桶守恒。
+-- 不触碰真实分区表 RDW_ODS_FLINK_METRICS（避免分区不存在 / 污染 / 误删风险），
+-- 与 03/04/05 测试同风格（本地即可执行逻辑校验，无需真实数据）。
 
--- 清理测试数据
-DELETE FROM RDW_ODS_FLINK_METRICS 
-WHERE job_name = 'paimon-perf-test-test';
+DROP TABLE IF EXISTS test_metrics_view_input;
 
--- 插入测试数据（对齐真实表12字段）
-INSERT INTO RDW_ODS_FLINK_METRICS VALUES
-(
-  '2024-01-01',                                              -- etl_dt
-  'PAIMON_METADATA_paimon.file.count_1704067200000',        -- metric_id (2024-01-01 00:00:00)
-  'paimon-perf-test-test',                                   -- job_name (加test后缀避免污染生产数据)
-  'wide_table',                                              -- app_id
-  '',                                                        -- job_id
-  '',                                                        -- host_name
-  '',                                                        -- container_id
-  '',                                                        -- container_rule
-  'paimon.file.count',                                       -- metric_name
-  'PAIMON_METADATA',                                         -- metric_type
-  '100.0',                                                   -- metric_value (String)
-  '1704067200000'                                            -- metric_ts (String, 2024-01-01 00:00:00)
-),
-(
-  '2024-01-01',
-  'PAIMON_METADATA_paimon.file.count_1704067230000',
-  'paimon-perf-test-test',
-  'wide_table',
-  '',
-  '',
-  '',
-  '',
-  'paimon.file.count',
-  'PAIMON_METADATA',
-  '150.0',
-  '1704067230000'                                            -- 2024-01-01 00:00:30（同一分钟）
-),
-(
-  '2024-01-01',
-  'PAIMON_METADATA_paimon.file.count_1704067260000',
-  'paimon-perf-test-test',
-  'wide_table',
-  '',
-  '',
-  '',
-  '',
-  'paimon.file.count',
-  'PAIMON_METADATA',
-  '200.0',
-  '1704067260000'                                            -- 2024-01-01 00:01:00（下一分钟）
-);
+-- 模拟真实表的原始字段类型：metric_value / metric_ts 均为 varchar
+CREATE TABLE test_metrics_view_input (
+  test_case     VARCHAR(100),
+  metric_type   VARCHAR(50),
+  metric_name   VARCHAR(100),
+  metric_value  VARCHAR(50),
+  metric_ts     VARCHAR(50)
+) DUPLICATE KEY(test_case)
+DISTRIBUTED BY HASH(test_case) BUCKETS 1;
 
--- 验证：修改WHERE条件使用测试数据
+-- 三条样本：前两条同一分钟（00:00:00 / 00:00:30），第三条下一分钟（00:01:00）
+INSERT INTO test_metrics_view_input VALUES
+  ('t0_同分钟',   'PAIMON_METADATA', 'paimon.file.count', '100.0', '946684800000'),
+  ('t1_同分钟',   'PAIMON_METADATA', 'paimon.file.count', '150.0', '946684830000'),
+  ('t2_下一分钟', 'PAIMON_METADATA', 'paimon.file.count', '200.0', '946684860000');
+
+-- 复现 metrics_view 的映射 + 分桶表达式（与 01_metrics_view.sql 保持一致）
 SELECT
-  source,
+  metric_type AS source,
   metric_name,
-  metric_value,
-  time_bucket_minute,
-  metric_ts_millis
-FROM (
-  SELECT
-    metric_type AS source,
-    metric_name,
-    CAST(metric_value AS DOUBLE) AS metric_value,
-    CAST(metric_ts AS BIGINT) AS metric_ts_millis,
-    FROM_UNIXTIME(CAST(metric_ts AS BIGINT) / 1000, '%Y-%m-%d %H:%i:00') AS time_bucket_minute
-  FROM RDW_ODS_FLINK_METRICS
-  WHERE metric_type = 'PAIMON_METADATA'
-    AND job_name = 'paimon-perf-test-test'
-    AND metric_name = 'paimon.file.count'
-) t
-ORDER BY metric_ts_millis;
+  CAST(metric_value AS DOUBLE) AS metric_value,
+  CAST(metric_ts AS BIGINT) AS metric_ts_millis,
+  FROM_UNIXTIME(CAST(metric_ts AS BIGINT) / 1000, '%Y-%m-%d %H:%i:00') AS time_bucket_minute
+FROM test_metrics_view_input
+ORDER BY CAST(metric_ts AS BIGINT);
 
--- 预期输出（3行）：
--- source='PAIMON_METADATA', metric_value=100.0, time_bucket_minute='2024-01-01 00:00:00', metric_ts_millis=1704067200000
--- source='PAIMON_METADATA', metric_value=150.0, time_bucket_minute='2024-01-01 00:00:00', metric_ts_millis=1704067230000
--- source='PAIMON_METADATA', metric_value=200.0, time_bucket_minute='2024-01-01 00:01:00', metric_ts_millis=1704067260000
+-- 预期（3 行）：前两条 time_bucket_minute 相同（同一分钟桶），第三条为下一分钟。
 
--- 断言：前两条属于同一分钟桶，第三条属于下一分钟桶
--- Property 10验证：时段分桶守恒（同一分钟内的记录被分到同一桶）
+-- 断言：3 条样本恰好落入 2 个分钟桶（Property 10：分钟分桶守恒）
+SELECT
+  '断言: 3条样本落入2个分钟桶' AS test_description,
+  COUNT(DISTINCT FROM_UNIXTIME(CAST(metric_ts AS BIGINT) / 1000, '%Y-%m-%d %H:%i:00')) AS distinct_buckets,
+  CASE WHEN COUNT(DISTINCT FROM_UNIXTIME(CAST(metric_ts AS BIGINT) / 1000, '%Y-%m-%d %H:%i:00')) = 2
+       THEN 'PASS' ELSE 'FAIL' END AS result
+FROM test_metrics_view_input;
 
--- 清理测试数据
-DELETE FROM RDW_ODS_FLINK_METRICS 
-WHERE job_name = 'paimon-perf-test-test';
+-- 清理
+DROP TABLE IF EXISTS test_metrics_view_input;
+
+-- 预期输出：断言 result = PASS

@@ -1,6 +1,6 @@
 -- 08_checkpoint_health.sql —— 快照推进健康度（Requirements 7.x 补充）
 -- 利用 Paimon 元数据采集器已采集的 paimon.snapshot.id / paimon.snapshot.time.millis，
--- 验证 Flink checkpoint → Paimon commit 是否正常推进。
+-- 验证 Flink checkpoint → Paimon commit 是否正常推进。视图统一建在 RDW_DATA。
 --
 -- 健康的流式入湖应满足：
 --   1. snapshot_id 随时间单调递增（每次 checkpoint 产生新快照）；
@@ -8,18 +8,18 @@
 -- 若 snapshot_id 长时间不变（增量=0），说明 checkpoint 失败或写入阻塞——
 -- 这是端到端延迟超标（SLA: ≤3分钟）的根因之一。
 --
--- 字段映射：metrics_view 已把 metric_type→source、metric_ts→分桶；
--- snapshot.id / snapshot.time.millis 均为 PAIMON_METADATA 来源。
+-- 数据来源：job_name='wide_table' 的 Paimon 元数据（snapshot.id / snapshot.time.millis）。
+-- 说明：metrics_view 已把 metric_type→source、metric_value→DOUBLE、metric_ts→分钟桶。
 
 -- ==================== 视图1：快照推进明细 ====================
 -- 按时段取每个表的最新 snapshot_id 与提交时间，并用窗口函数算相邻增量。
-CREATE OR REPLACE VIEW checkpoint_health AS
+CREATE OR REPLACE VIEW RDW_DATA.checkpoint_health AS
 SELECT
   job_name,                                            -- 被监测的表名（多表区分）
   time_bucket_minute,
   snapshot_id,
   snapshot_commit_time_millis,
-  -- 相邻时段快照号增量：>0 表示正常推进，=0 表示停滞，NULL 为首行
+  -- 相邻时段快照号增量：>0 正常推进，=0 停滞，NULL 为首行
   snapshot_id - LAG(snapshot_id) OVER (
       PARTITION BY job_name ORDER BY time_bucket_minute
   ) AS snapshot_id_delta,
@@ -36,16 +36,15 @@ FROM (
              THEN metric_value END) AS snapshot_id,
     MAX(CASE WHEN metric_name = 'paimon.snapshot.time.millis'
              THEN metric_value END) AS snapshot_commit_time_millis
-  FROM metrics_view
+  FROM RDW_DATA.metrics_view
   WHERE source = 'PAIMON_METADATA'
     AND metric_name IN ('paimon.snapshot.id', 'paimon.snapshot.time.millis')
   GROUP BY job_name, time_bucket_minute
-) t
-ORDER BY job_name, time_bucket_minute;
+) t;
 
 -- ==================== 视图2：快照停滞告警 ====================
--- 筛选快照号停滞（增量=0）的时段，这些是 checkpoint 异常的嫌疑时段。
-CREATE OR REPLACE VIEW checkpoint_stall_alert AS
+-- 筛选快照号停滞（增量=0）或推进过慢（间隔>180秒）的时段。
+CREATE OR REPLACE VIEW RDW_DATA.checkpoint_stall_alert AS
 SELECT
   job_name,
   time_bucket_minute,
@@ -53,9 +52,7 @@ SELECT
   snapshot_id_delta,
   commit_interval_sec,
   CASE
-    -- 快照号未增长：checkpoint 失败或写入完全阻塞
     WHEN snapshot_id_delta = 0 THEN 'STALL'
-    -- 提交间隔过长（> 180 秒，即 SLA 延迟上限）：推进过慢
     WHEN commit_interval_sec > 180 THEN 'SLOW'
     ELSE 'OK'
   END AS health_status,
@@ -66,10 +63,9 @@ SELECT
          THEN CONCAT('推进过慢: 提交间隔 ', ROUND(commit_interval_sec, 1), ' 秒 > 180 秒')
     ELSE '正常推进'
   END AS health_detail
-FROM checkpoint_health
-WHERE snapshot_id_delta IS NOT NULL           -- 排除每个表的首行（无前值可比）
-  AND (snapshot_id_delta = 0 OR commit_interval_sec > 180)
-ORDER BY job_name, time_bucket_minute;
+FROM RDW_DATA.checkpoint_health
+WHERE snapshot_id_delta IS NOT NULL           -- 排除每个表首行（无前值可比）
+  AND (snapshot_id_delta = 0 OR commit_interval_sec > 180);
 
 -- 说明：
 -- 1. checkpoint_health：全量快照推进明细，含增量与提交间隔，供趋势观察。

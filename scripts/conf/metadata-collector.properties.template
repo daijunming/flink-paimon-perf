@@ -23,14 +23,14 @@ collect.interval.seconds=30
 # 仅 Kerberized 集群需要；principal 与 keytab 必须成对配置（同时填或同时留空）。
 # 留空则跳过认证，兼容非 Kerberos 环境。
 
-# Kerberos principal（如 rtp_usr@REALM.COM）
+# Kerberos principal（如 flink_user@REALM.COM）
 # kerberos.principal=${KERBEROS_PRINCIPAL}
 
 # keytab 文件路径
 # kerberos.keytab=${KERBEROS_KEYTAB}
 
 # krb5.conf 路径（可选，留空用系统默认 /etc/krb5.conf）
-# kerberos.krb5.conf=/home/rtp_usr/kerberos/krb5.conf
+# kerberos.krb5.conf=/home/flink_user/kerberos/krb5.conf
 
 # ==================== 配置加载方式 ====================
 # 本文件可通过三种方式被加载（优先级从高到低）：
