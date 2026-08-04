@@ -1,0 +1,236 @@
+# Paimon 表健康监控与治理（闸②交付物模板）
+
+> 🟡 **建设期材料**：仅当 Paimon 进入选型终选、进到「能否运维（闸②）」环节时才需完整启用。当前阶段只作**可行性参考**（证明 Paimon 可监控），不是待办。当前该做的事见 [`table-format-poc-roadmap.md`](table-format-poc-roadmap.md)。
+
+> 版本基线：Flink 1.19 + Apache Paimon 1.1.x（与 `paimon-streaming-layering.md` 对齐）。指标名以 [Paimon 1.1 Metrics](https://paimon.apache.org/docs/1.1/maintenance/metrics/) 与 [System Tables](https://paimon.apache.org/docs/master/concepts/system-tables/) 核实，待核实处已标注。
+> **这份文档的定位**：它是 `paimon-vs-iceberg-poc.md` 里 **闸②（团队能监控/能运维 Paimon）** 的交付物模板。填实它 = 拿到「我们能托住 Paimon」中「能监控」这一关的证据。结构刻意对齐 `iceberg-flink-monitoring-metrics.md`，便于两者同口径对比。
+> 怎么读：决策/评审看[第 0 层](#第-0-层执行摘要)；做 PoC/实施看 0→2 层；自动化监测按[第 3 层](#第-3-层规格)实现。
+
+---
+
+# 第 0 层：执行摘要
+
+## 0.1 一个对闸②有利的结论
+
+Iceberg 上需要旁路才能看的表健康信号（小文件、读放大、提交冲突、compaction 是否跟得上），在 Paimon 里**大多是原生 Flink 指标**（commit / compaction / scan / writeBuffer 四组，经 `FlinkMetricRegistry` 桥接到 Flink 指标系统）。也就是说：
+
+- 这些指标**直接走你们已建的「指标→Kafka」链路**，无需为它们另搭旁路或另一套 reporter。
+- 相比 Iceberg「引擎侧已通、表侧两个缺口」的格局，**Paimon 的表健康有更大比例落在引擎侧（已通）**。
+- 因此「能监控 Paimon」这关，工作量比给 Iceberg 补监控**更小**——这对闸②是实打实的加分。
+
+## 0.2 覆盖盘点
+
+| 监控块 | 内容 | 来源 | 现状 |
+|---|---|---|---|
+| 提交健康 | commit 时延、**冲突重试 `lastCommitAttempts`**、生成 snapshot 数 | 原生 Flink 指标（commit） | ✅ 走 Kafka，无需额外 |
+| **compaction 健康（核心）** | **L0 文件数、compaction 线程繁忙度、是否跟得上** | 原生 Flink 指标（compaction） | ✅ 走 Kafka |
+| 写入/缓冲 | 写缓冲占用、抢占、writer 数 | 原生 Flink 指标（writeBuffer） | ✅ 走 Kafka |
+| 扫描/读规划 | scan 时延、跳过/命中文件 | 原生 Flink 指标（scan，需 Flink≥1.18） | ✅ 走 Kafka |
+| 流消费滞后 | source 事件时间滞后、consumer 进度 | Flink 连接器标准指标 + `$consumers` 系统表 | ⚠️ 指标走 Kafka；consumer lag 需旁路 |
+| 表级累计 | snapshot 累积、文件分布、分区倾斜、孤儿文件 | 系统表旁路查询 | ⚠️ 需旁路（少量，远小于 Iceberg） |
+
+## 0.3 投入与产出（作为闸②证据）
+
+- 投入：复用现有 Kafka 链路接 Paimon 原生指标（小）+ 一个查系统表的旁路体检作业（小，比 Iceberg 那套轻）。
+- 产出：Paimon 监控指标清单 + 告警规则 + 系统表巡检 SOP + 一次故障恢复演练记录 —— 即 [poc 文档 1.4](paimon-vs-iceberg-poc.md) 闸② 的「能监控/能运维/能排障」证据。
+
+---
+
+# 第 1 层：全景与指标来源
+
+## 1.1 Paimon 健康的两个视角（与 Iceberg 同框架，占比不同）
+
+Paimon 是 LSM 架构的流原生表格式。健康 = 元数据健康 + LSM 数据布局健康（含 compaction）+ 提交链路健康。监控同样分引擎侧/表侧，但**比 Iceberg 更多落在引擎侧**：
+
+```
+引擎侧（原生 Flink 指标，已走 Kafka）        表侧（系统表旁路）
+  ├─ 写得进吗：commit 时延/冲突/snapshot 数     ├─ snapshot 是否过量累积
+  ├─ compaction 跟得上吗：L0 文件数/线程繁忙     ├─ 文件/分区分布、倾斜
+  ├─ 写缓冲是否吃紧：buffer 占用/抢占            ├─ consumer 消费滞后
+  └─ 读规划快吗：scan 时延/跳过文件             └─ 孤儿文件、标签/分支
+```
+
+> 与 Iceberg 的关键差异：Iceberg 的「小文件/读放大」要靠旁路查元数据才知道；Paimon 的同类信号（**L0 文件数、compactionThreadBusy**）是**实时的 Flink 指标**——因为 compaction 是 Paimon 写入路径的一等公民。
+
+## 1.2 指标来源三条
+
+| 来源 | 接口/方式 | 覆盖 | 是否已走 Kafka |
+|---|---|---|---|
+| Paimon 原生指标 | `FlinkMetricRegistry` 桥接到 Flink 指标系统（scan/commit/write/writeBuffer/compaction） | 写入、提交、compaction、scan、缓冲 | ✅（随平台 Flink reporter） |
+| Flink 连接器标准指标 | FLIP-33（source/sink） | 流消费滞后、sink 吞吐 | ✅ |
+| Paimon 系统表 | Flink/Spark 查 `<table>$snapshots` 等 | 全表累计健康 | ⚠️ 旁路作业 |
+
+> 重要：Paimon 指标在 Flink 里的 scope 里嵌了 `paimon.table.<表名>.<commit|scan|writer|compaction|writeBuffer>`，且 **compaction/write 指标是按 `partition.<分区>.bucket.<桶>` 维度**的——基数高，消费端聚合时要注意按桶聚合或限维。
+
+---
+
+# 第 2 层：实施（怎么落地监控）
+
+> 引擎侧四组原生指标已随 Kafka 进来，落地重点是「消费端按表/桶聚合 + 配告警」；表侧建一个轻量系统表旁路。精确指标名见第 3 层。
+
+## 2.1 提交健康（commit 指标）
+
+落地确认三件事：
+- **冲突重试**：`lastCommitAttempts` > 1 = 提交冲突（Paimon 原生就有，不像 Iceberg 要另接 reporter 才拿得到 `attempts`）。
+- **提交时延**：`lastCommitDuration` / `commitDuration`(直方图)突增 = 提交变重。
+- **每次提交产出**：`lastGeneratedSnapshots`、`lastTableFilesAdded/Deleted`、`lastPartitionsWritten/lastBucketsWritten` —— 判断写入形态与是否在制造碎片。
+
+## 2.2 compaction 健康（LSM 的命门，最该盯）
+
+Paimon 的读性能和写放大都系于 compaction 能否跟上。核心信号：
+- **`maxLevel0FileCount` / `avgLevel0FileCount`**：L0 文件堆积 = 异步 compaction 没跟上 → 读放大、查询变慢。这是 Paimon 版的「小文件/读放大」实时信号。
+- **`compactionThreadBusy`**：接近 100 = compaction 线程一直在忙、压不下去（每并行度只有一个 compaction 线程）。
+- `avgCompactionTime`、`compactionQueuedCount`、`compactionCompletedCount`：compaction 耗时与积压。
+- `maxCompactionInputSize/OutputSize`、`maxTotalFileSize`：单桶文件规模。
+
+> 阈值方向：`maxLevel0FileCount` 持续走高 **且** `compactionThreadBusy≈100` = compaction 扛不住，需要加专门 compaction 资源 / 调 `num-sorted-run.compaction-trigger` 等。这组是 PoC「高频写后小文件/读放大」场景的**直接读数**。
+
+## 2.3 写缓冲与背压（writeBuffer 指标）
+
+- `usedWriteBufferSizeByte` vs `totalWriteBufferSizeByte`：缓冲吃满 → flush 频繁 → 小文件。
+- `bufferPreemptCount`：内存抢占次数高 = 写缓冲不足。
+- `numWriters`：单并行度 writer 数（高基数分区/桶下会涨）。
+
+## 2.4 读规划（scan 指标，Flink≥1.18）
+
+- `lastScanDuration` / `scanDuration`：scan 规划耗时。
+- `lastScannedManifests`、`lastScanSkippedTableFiles` / `lastScanResultedTableFiles`：跳过/命中文件——裁剪是否生效（对应 Iceberg 的 skipped/total 比）。
+
+## 2.5 流消费滞后（changelog / consumer）
+
+- **Flink 连接器标准指标**：`currentEmitEventTimeLag` / `currentFetchEventTimeLag` —— 下游流读的端到端滞后。注意：指定了 `consumer-id` 时，source 指标层级会移到 reader 算子。
+- **consumer 进度**：查 `<table>$consumers` 系统表看每个 consumer 的 next snapshot，与最新 snapshot 比得到「消费滞后多少个 snapshot」。
+- 重要副作用：`consumer-id` 会**钉住**未消费的 snapshot，使 snapshot 过期不会删掉仍被消费的版本——所以「consumer 卡住」会**间接导致 snapshot/存储膨胀**，这两件事要一起看。
+
+## 2.6 表级累计健康（系统表旁路，轻量）
+
+复用 `iceberg-flink-monitoring-metrics.md` 第五节的「成本轴法」推诉求，但 Paimon 这边能落到原生指标的更多，旁路只需补「累计/分布」类：
+
+- snapshot 累积：`$snapshots`（Paimon 默认按 `snapshot.num-retained.*` / `snapshot.time-retained` **自动过期**，不像 Iceberg 要手动 expire——所以这里更多是「确认自动过期生效」而非「催人去清」）。
+- 文件/分区分布、倾斜：`$files`、`$partitions`、`$buckets`(待核实)。
+- 孤儿文件：`orphan_files` 清理动作 / 比对 manifest 引用。
+- 标签/分支留存：`$tags`。
+
+## 2.7 接入：全部汇现有 Kafka 链路
+
+引擎侧四组 + 连接器标准指标随平台 Flink reporter 进 Kafka；系统表旁路结果也推同一出口。维度统一打 `table`，compaction/write 维度额外带 `partition`/`bucket`，Flink 侧带 `job_name`/`yarn_app_id`（与 Iceberg 监控同口径，便于对比评分）。
+
+---
+
+# 第 3 层：规格
+
+## 3.1 全量指标表
+
+来源列：①=Paimon 原生 Flink 指标（已走 Kafka）；②=Flink 连接器标准指标；③=系统表旁路。
+
+### Commit（scope `paimon.table.<t>.commit`，committer 算子；来源①）
+| 指标 | 类型 | 含义 |
+|---|---|---|
+| `lastCommitDuration` / `commitDuration` | Gauge / Histogram | 上次/近几次提交耗时 |
+| `lastCommitAttempts` | Gauge | 上次提交尝试次数（>1 = 冲突重试） |
+| `lastGeneratedSnapshots` | Gauge | 上次提交生成的 snapshot 数（1 或 2） |
+| `lastTableFilesAdded` / `Deleted` / `Appended` / `CommitCompacted` | Gauge | 上次提交新增/删除/追加/合并的表文件数 |
+| `lastChangelogFilesAppended` / `CommitCompacted` | Gauge | changelog 文件追加/合并数 |
+| `lastDeltaRecordsAppended` / `lastChangelogRecordsAppended` | Gauge | APPEND 提交的 delta/changelog 记录数 |
+| `lastDeltaRecordsCommitCompacted` / `lastChangelogRecordsCommitCompacted` | Gauge | COMPACT 提交的记录数 |
+| `lastPartitionsWritten` / `lastBucketsWritten` | Gauge | 上次提交写入的分区/桶数 |
+| `lastCompactionInputFileSize` / `OutputFileSize` | Gauge | 上次 compaction 输入/输出总大小 |
+
+### Compaction（scope `...partition.<p>.bucket.<b>.compaction`，writer 算子；来源①）
+| 指标 | 类型 | 含义 |
+|---|---|---|
+| `maxLevel0FileCount` / `avgLevel0FileCount` | Gauge | L0 文件数（堆积=compaction 跟不上=读放大） |
+| `compactionThreadBusy` | Gauge | compaction 线程繁忙度 0~100（≈100=压不住） |
+| `avgCompactionTime` | Gauge | compaction 平均耗时 |
+| `compactionCompletedCount` / `compactionQueuedCount` | Counter | 已完成 / 排队中的 compaction 数 |
+| `maxCompactionInputSize` / `avgCompactionInputSize` | Gauge | compaction 输入文件大小 |
+| `maxCompactionOutputSize` / `avgCompactionOutputSize` | Gauge | compaction 输出文件大小 |
+| `maxTotalFileSize` / `avgTotalFileSize` | Gauge | 活跃桶的总文件大小 |
+
+### Write Buffer（scope `...writeBuffer`，writer 算子；来源①）
+| 指标 | 类型 | 含义 |
+|---|---|---|
+| `numWriters` | Gauge | 本并行度 writer 数 |
+| `usedWriteBufferSizeByte` / `totalWriteBufferSizeByte` | Gauge | 已用 / 总写缓冲 |
+| `bufferPreemptCount` | Gauge | 内存抢占次数 |
+
+### Scan（scope `...scan`，JM enumerator；来源①，Flink≥1.18）
+| 指标 | 类型 | 含义 |
+|---|---|---|
+| `lastScanDuration` / `scanDuration` | Gauge / Histogram | scan 规划耗时 |
+| `lastScannedManifests` | Gauge | 上次 scan 扫描的 manifest 数 |
+| `lastScanSkippedTableFiles` / `lastScanResultedTableFiles` | Gauge | 跳过 / 命中文件数 |
+
+### 连接器标准 + 系统表（来源②③）
+| 指标/对象 | 来源 | 含义 |
+|---|---|---|
+| `currentEmitEventTimeLag` / `currentFetchEventTimeLag` | ② source | 流读端到端事件时间滞后 |
+| `numRecordsOut` / `numRecordsOutPerSecond` | ② sink | sink 输出量/速率 |
+| `$snapshots` 行数 / 最新 `commit_time` 距今 | ③ | snapshot 累积；提交链路表侧存活 |
+| `$consumers` next-snapshot vs 最新 | ③ | consumer 消费滞后（钉住 snapshot 风险） |
+| `$files` / `$partitions` 聚合 | ③ | 文件分布、分区倾斜、小文件 |
+
+## 3.2 告警规则
+
+| 优先级 | 告警项 | 指标 | 建议规则 |
+|---|---|---|---|
+| P0 | compaction 压不住 | `maxLevel0FileCount` + `compactionThreadBusy` | L0 持续走高 **且** busy≈100 |
+| P0 | 提交存活 | `$snapshots` 最新 commit_time 距今（③）/ sink 长时间无 `numRecordsOut` | 超预期提交间隔 |
+| P1 | 提交冲突 | `lastCommitAttempts` | 持续 >1 |
+| P1 | 提交变慢 | `lastCommitDuration` | 相对基线突增 |
+| P1 | 写缓冲吃紧 | `usedWriteBufferSizeByte/totalWriteBufferSizeByte`、`bufferPreemptCount` | 占比持续高 / 抢占频繁 |
+| P1 | 流消费滞后 | `currentEmitEventTimeLag` / consumer next-snapshot 落后 | 超新鲜度目标 |
+| P2 | snapshot/存储膨胀 | `$snapshots` 行数、consumer 钉住 | 超阈值（多因 consumer 卡住或自动过期未生效） |
+| P2 | 读裁剪失效 | `lastScanSkippedTableFiles/Resulted` | 跳过占比持续偏低 |
+
+> 设计原则同 Iceberg 文档：先保「活着」（compaction 跟得上 + 提交存活）→ 再保「不退化」→ 最后保「不长期烂」。**Paimon 的头号告警是 compaction 是否跟得上**（对应 Iceberg 的提交存活）。
+
+## 3.3 系统表巡检定义
+
+旁路作业按 3.1 系统表行实现：Flink/Spark 查 `<db>.<table>$snapshots / $files / $partitions / $consumers / $tags`（系统表名以目标版本[文档](https://paimon.apache.org/docs/master/concepts/system-tables/)为准），结果打 `table` label 进 Kafka，与引擎侧指标同口径。
+
+---
+
+# 第 4 层：论证与对照
+
+## A. 成本轴法在 Paimon 上的落点（哪些被原生指标覆盖）
+
+沿用 Iceberg 文档的五条成本轴，看 Paimon 各轴靠什么监控：
+
+| 成本轴 | Iceberg（多靠旁路） | Paimon（多靠原生指标） |
+|---|---|---|
+| 元数据读取 | 旁路查 snapshot/manifest | scan 指标 + `$snapshots`（自动过期） |
+| 数据扫描/读放大 | 旁路算 delete:data | **原生 `maxLevel0FileCount`/`compactionThreadBusy`** |
+| 存储 | 旁路查孤儿/过期 | snapshot 自动过期 + `orphan_files`；注意 consumer 钉住 |
+| catalog 完整性 | 旁路（HadoopCatalog 无锁） | 同样需关注 catalog（待 PoC 确认 Paimon 用的 catalog/锁语义） |
+| 演进债 | 旁路查 spec/schema | `$schemas` |
+
+> 结论：**轴2（读放大）在 Paimon 从「旁路才知道」升级成「实时 Flink 指标」**，这是 Paimon 可监控性优于 Iceberg 的最大单点。
+
+## B. 为什么这对闸②是加分
+
+闸②要的是「能监控、能运维、能排障」。Paimon 把最难监控的 LSM 健康（compaction/读放大/冲突）做成原生实时指标，意味着：
+- 团队建监控的工作量更小、信号更实时；
+- 出事时有直接读数定位（L0 堆积、线程繁忙、commit attempts），排障门槛更低；
+- 这些都能写进 PoC 的闸②证据。
+
+> 但注意：可监控性强 ≠ 能兜底。compaction 调优、版本升级、冷门 bug 自救仍是团队责任（无腾讯 SLA）。监控好只是闸②的「能监控」一项，「能运维/能排障/能兜底」仍需在 PoC 演练取证。
+
+## C. 待核实 / PoC 验证项
+
+- Paimon 在本栈用什么 catalog、其并发/锁语义（对应 Iceberg 的 HadoopCatalog 无锁问题是否存在）。
+- `$buckets` 等系统表在 1.1.x 的确切名称与字段。
+- scan 指标需 Flink≥1.18（你们 1.19 满足）。
+- compaction/write 指标按 partition.bucket 高基数，消费端聚合策略需实测确认不打爆时序库。
+
+## D. 与其它文档的关系
+- 闸②归属：[`paimon-vs-iceberg-poc.md`](paimon-vs-iceberg-poc.md) 1.4 / 2.1，本文是其「能监控」交付物模板。
+- 同口径对照：[`iceberg-flink-monitoring-metrics.md`](iceberg-flink-monitoring-metrics.md)（结构一致，便于评分表逐项对比）。
+- Paimon 机制：[`paimon-streaming-layering.md`](paimon-streaming-layering.md)。
+
+## 参考来源
+- [Paimon 1.1 — Metrics](https://paimon.apache.org/docs/1.1/maintenance/metrics/)（指标名逐项核实）
+- [Paimon — System Tables](https://paimon.apache.org/docs/master/concepts/system-tables/)
+- [Paimon — Primary Key Table / Compaction](https://paimon.apache.org/docs/1.1/primary-key-table/compaction/)
+
+> 外部内容已改写归纳，未逐字摘录。
