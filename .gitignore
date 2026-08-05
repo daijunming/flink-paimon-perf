@@ -29,3 +29,7 @@ target/
 *.iml
 .vscode/
 dependency-reduced-pom.xml
+common/.jqwik-database
+data-generator/.jqwik-database
+metadata-collector/.jqwik-database
+resource-collector/.jqwik-database
