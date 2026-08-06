@@ -43,6 +43,12 @@ Maven 多模块工程（根 `pom.xml`，groupId `com.paimonperf`，packaging `po
   `01_metrics_view.sql`（分钟分桶 + 五个真实 job_name 白名单），其余为
   `02_four_category_metrics.sql` / `05_health_flags.sql` / `08_checkpoint_health.sql` /
   `09_streaming_read.sql`（流式读性能）及各自自包含的 `_test.sql`。
+- `scripts/meta-collect/` — Paimon 元数据周期批采集（crontab + Flink SQL Batch，无状态简化版）。
+  每轮全量重采 `$snapshots`/`$statistics` 未过期部分 + `$files`/`$manifests`/`$options`/`$consumers`
+  当前态（作业内 `MAX(snapshot_id)` 打标），经 Kafka（topic 名与 SR 表一致：
+  `rdw_ods_paimon_meta_*`）由 Routine Load 进 StarRocks ODS 层（`RDW_DATA.rdw_ods_paimon_meta_*`，
+  只存可复核事实，健康结论由分析层计算；PRIMARY KEY 主键覆盖保证幂等，无本地游标）。
+  与 metadata-collector **并存**：那是聚合指标通路，这是行级历史通路。详见其 README.md。
 - `docs/` — 需求、设计、验证文档（中文）。
 - `.kiro/` — 可移植的 AI 协作护栏**模板套件**（steering toolkit），非本项目的活跃 steering，
   不会被自动加载；其中 `git-commit-language.md` 描述了本仓库沿用的提交信息口径。
@@ -118,6 +124,11 @@ SOURCE 08_checkpoint_health_test.sql;
 - **语言**：代码注释、文档、提交信息一律用**中文**；标识符用英文。
   提交信息格式 `type(scope): 描述`（type/scope 英文，描述中文，
   如 `refactor(analysis-sql,scripts): 对齐真实环境并脱敏敏感信息`），与 git 历史一致。
+- **注释与解释的信息标准**：只承载代码里看不出来的信息——动机与约束（为什么存在）、
+  触发条件（什么时候要动它）、后果与风险（动了会怎样）。禁止三种写法：复述代码
+  （读者看代码即得的信息再说一遍）、名词套名词（用术语定义术语，不落到读者的具体处境）、
+  指针接力（"见 XX 说明"而两处都不给实质内容）。自检方式：这句话删掉，读者会失去什么
+  判断依据？什么都不失去就删。解释代码时同理：说"它存在的理由"，不逐行复述结构。
 - **I/O 与纯逻辑分离**（本仓库最重要的结构约定）：
   Paimon API 调用（`PaimonSystemTableMetadataReader`）与映射逻辑（`MetadataMetricMapper`）分开；
   HTTP 调用（`HttpRestClient`）与解析逻辑（`ResourceMetricParser`）分开。
@@ -174,6 +185,8 @@ SOURCE 08_checkpoint_health_test.sql;
    `java -jar metadata-collector.jar metadata-collector.properties`、
    `java -jar resource-collector.jar resource-collector.properties`（常驻，Ctrl+C 优雅关闭）。
 7. StarRocks 侧按第四节顺序执行分析 SQL 观测。
+8. （可选）行级元数据历史：按 `scripts/meta-collect/README.md` 部署（SR 建表 + Routine Load
+   + `meta-collect.properties` + crontab 每 3 分钟 `collect_once.sh`）。
 
 阶段化差异（生成器/采集器配置）：阶段1 `rate.limit.enabled=false`（不限速探上限）、
 采集周期 30s；阶段2 `rate.limit.enabled=true` + `rate.limit.rps=20000`、采集周期 60s。

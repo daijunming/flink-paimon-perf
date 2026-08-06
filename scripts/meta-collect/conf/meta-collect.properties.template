@@ -1,0 +1,52 @@
+# meta-collect.properties.template —— Paimon 元数据周期批采集(crontab + Flink SQL Batch)配置模板
+# 部署时复制为 meta-collect.properties 并填入真实环境值。
+# 注意:本文件会被 collect_once.sh 用 bash source 方式加载,值含空格/引号时必须加英文双引号。
+
+# ==================== 被监控的 Paimon 表(必填)====================
+# Paimon 仓库 HDFS 路径(与入湖作业 catalog 的 warehouse 一致)
+PAIMON_WAREHOUSE=${PAIMON_WAREHOUSE}
+
+# catalog / database / table(非敏感逻辑值,与 scripts/sql/ 一致)
+PAIMON_CATALOG=paimon_obs
+PAIMON_DATABASE=paimon_database
+PAIMON_TABLE=wide_table
+
+# ==================== Kafka(必填)====================
+KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS}
+
+# Kafka 安全等附加 WITH 项,拼在 kafka sink DDL 的 properties.bootstrap.servers 之后。
+# 非 Kerberos 环境留空;需要时单行书写、以英文逗号开头,例如:
+# KAFKA_WITH_EXTRA=", 'properties.security.protocol' = 'SASL_PLAINTEXT', 'properties.sasl.mechanism' = 'GSSAPI', 'properties.sasl.jaas.config' = '...'"
+KAFKA_WITH_EXTRA=
+
+# 元数据 topic:与 StarRocks ODS 表名一一对应(rdw_ods_paimon_meta_*),
+# 按元表类型分,不按业务表分——新增被监控表无需新建 topic/SR 表。
+TOPIC_SNAPSHOTS=rdw_ods_paimon_meta_snapshots
+TOPIC_STATISTICS=rdw_ods_paimon_meta_statistics
+TOPIC_FILES=rdw_ods_paimon_meta_files
+TOPIC_MANIFESTS=rdw_ods_paimon_meta_manifests
+TOPIC_PARTITIONS=rdw_ods_paimon_meta_partitions
+TOPIC_BUCKETS=rdw_ods_paimon_meta_buckets
+TOPIC_CONSUMERS=rdw_ods_paimon_meta_consumers
+TOPIC_OPTIONS=rdw_ods_paimon_meta_options
+TOPIC_RUNS=rdw_ods_paimon_meta_collect_runs
+
+# ==================== Flink 提交通道(必填)====================
+# sql-client 路径(默认提交通道;若平台支持 batch SQL 作业,可改为包装平台提交命令的脚本,
+# 只要保持"<命令> [opts] -f <sql文件>"的调用约定即可)
+FLINK_SQL_CLIENT=/opt/flink/bin/sql-client.sh
+
+# 追加给 sql-client 的额外参数(如 YARN 队列/-D 配置),可空,例如:
+# FLINK_SUBMIT_OPTS="-Dyarn.application.queue=root.default"
+FLINK_SUBMIT_OPTS=
+
+# ==================== 工作目录(可选)====================
+# 渲染留档与锁文件目录(非状态,可随意清理),默认脚本同级 ../state
+# WORK_DIR=/home/<user>/paimon-meta-collect/state
+
+# ==================== collect_runs 上报(可选)====================
+# kafka-console-producer 路径(用于写采集运行记录;找不到时仅告警,不影响采集)
+KAFKA_CONSOLE_PRODUCER=kafka-console-producer.sh
+
+# producer 客户端安全配置文件路径(SASL 环境需要),可空
+# KAFKA_CLIENT_PROPS=/home/<user>/kafka-client-sasl.properties

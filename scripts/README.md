@@ -21,6 +21,12 @@ scripts/
 │  ├─ metadata-collector.properties.template      # 元数据采集器配置
 │  ├─ resource-collector.properties.template      # 资源采集器配置
 │  └─ README.md                # 占位符含义与阶段化配置建议
+├─ meta-collect/               # Paimon 元数据周期批采集（crontab + Flink SQL Batch，与组件 c 并存的行级通路）
+│  ├─ sr/                      # StarRocks 历史表 DDL + 派生视图 + Routine Load
+│  ├─ flink-sql/               # 采集 SQL 模板（00 latest / 10 主采集 / 20 consumers）
+│  ├─ conf/                    # meta-collect.properties 模板
+│  ├─ bin/collect_once.sh      # 单轮编排（flock 防重入 + 游标推进 + runs 记录）
+│  └─ README.md                # 链路、部署步骤、幂等与重放语义
 └─ README.md（本文件）
 ```
 
@@ -33,6 +39,11 @@ scripts/
 - **Java 组件配置**：`.properties.template` 模板，部署时复制并填入真实环境值（或由编排脚本自动化替换占位符）
 - **Java 组件产物**：三个 shaded fat jar（`data-generator.jar` / `metadata-collector.jar` / `resource-collector.jar`），
   由 Maven 构建在各自模块的 `target/` 目录产出，搬运到离线集群后用 `java -jar xxx.jar config.properties` 启动
+- **元数据周期批采集**（`meta-collect/`）：crontab 每 3 分钟触发有界 Flink SQL Batch 作业，
+  将 Paimon 系统表在 Snapshot 边界的状态经 Kafka 写入 StarRocks ODS 层
+  （`rdw_ods_paimon_meta_*`，topic 名与表名一致）；
+  与 Java metadata-collector 并存——后者是聚合指标通路（进 `RDW_ODS_FLINK_METRICS`），
+  本通路是行级历史，独立 topic、独立 SR 表。详见 `meta-collect/README.md`
 
 ## 占位符约定（运行环境注入，仓库内不填真值）
 
