@@ -21,7 +21,7 @@
 |---------|---------|-------------------|---------|
 | **场景 1：单写入性能** | 写入吞吐、反压、checkpoint 成功率 | `DataStreamperf_paimon` | `metrics_ingest_perf`<br>`metrics_write_health` |
 | **场景 2：单合并性能** | Compaction 繁忙度/耗时、L0 堆积、资源占用 | `compaction_job`<br>`wide_table`<br>`cluster` | `metrics_compaction_job`<br>`metrics_resource_compaction`<br>`health_flags` |
-| **场景 3：单查询性能（流式读）** | 流读吞吐、Source 反压、数据可见延迟 | `streaming_read_job`<br>（`scripts/sql/07_streaming_read.sql`，待运行）<br>`wide_table`（快照时间） | 待建视图<br>`checkpoint_health`（已建） |
+| **场景 3：单查询性能（流式读）** | 流读吞吐、Source 反压、数据可见延迟 | `streaming_read_job`<br>（`scripts/sql/07_streaming_read.sql`，待运行）<br>`wide_table`（快照时间） | `metrics_streaming_read`<br>`metrics_read_vs_write`（已建）<br>`checkpoint_health`（已建） |
 | **场景 4：单聚合性能** | 聚合吞吐、状态大小、算子繁忙度 | `streaming_agg_job`<br>（`scripts/sql/08_streaming_agg.sql`，待运行） | 待建视图 |
 | **场景 5：并发读写** | 写入吞吐波动、Compaction 相互影响、资源争抢 | 多作业组合观测 | 综合使用上述视图 |
 
@@ -158,7 +158,7 @@ ORDER BY time_bucket_minute;
 
 ### 接入状态与步骤
 
-⚠️ **当前状态**：流式读作业脚本已就绪，但配套分析视图尚未建立。
+⚠️ **当前状态**：分析视图已建（`analysis-sql/09_streaming_read.sql`，含 `metrics_streaming_read` / `metrics_read_vs_write`），`01_metrics_view.sql` 白名单已含 `streaming_read_job`。待办仅剩：提交作业 + 确认指标上报。
 
 **接入步骤**（需开发协助）：
 1. **提交流式读作业**：
@@ -178,28 +178,9 @@ ORDER BY time_bucket_minute;
      AND etl_dt = '<最新分区日期>';
    ```
 
-3. **修改分析视图白名单**：
-   ```sql
-   -- 编辑 analysis-sql/01_metrics_view.sql 末尾的 WHERE 子句
-   -- 在 job_name IN (...) 白名单中加入 'streaming_read_job'
-   WHERE job_name IN ('DataStreamperf_paimon', 'compaction_job', 
-                      'wide_table', 'cluster', 'streaming_read_job')  -- 新增
-   ```
+3. **修改分析视图白名单**（✅ 已完成）：`01_metrics_view.sql` 的 `job_name IN (...)` 已含 `'streaming_read_job'`；若实际作业名不同，改该白名单即可。
 
-4. **新建流式读分析视图**（可参考 `02_four_category_metrics.sql` 口径）：
-   ```sql
-   -- 新建 analysis-sql/09_streaming_read.sql
-   CREATE VIEW RDW_DATA.metrics_streaming_read AS
-   SELECT
-       time_bucket_minute,
-       MAX(CASE WHEN metric_name LIKE '%Source%numRecordsOut' 
-           THEN CAST(metric_value AS DOUBLE) END) AS source_records_out_total,
-       -- 分钟差分计算吞吐（复用 metrics_ingest_perf 口径）
-       -- ... 其他指标
-   FROM RDW_DATA.metrics_view
-   WHERE job_name = 'streaming_read_job'
-   GROUP BY time_bucket_minute;
-   ```
+4. **新建流式读分析视图**（✅ 已完成）：见 `analysis-sql/09_streaming_read.sql`，产出 `RDW_DATA.metrics_streaming_read`（流读吞吐 + Source 反压 + 软标志）与 `RDW_DATA.metrics_read_vs_write`（读写对照）。
 
 ### 临时查询方案（视图未建之前）
 
@@ -243,7 +224,7 @@ ORDER BY ts;
 
 ### 分析视图
 - **已建**：`RDW_DATA.checkpoint_health` / `checkpoint_stall_alert`（可见延迟与停滞，见 `analysis-sql/08_checkpoint_health.sql`）
-- **待建**：`RDW_DATA.metrics_streaming_read`（流读吞吐 + 反压），按上述接入步骤第 4 步创建
+- **已建**：`RDW_DATA.metrics_streaming_read` / `metrics_read_vs_write`（流读吞吐 + 反压 + 读写对照，见 `analysis-sql/09_streaming_read.sql`）
 
 ---
 
@@ -414,7 +395,7 @@ Flink 作业原生指标（metrics reporter）──────┘   → RDW_OD
 
 ### 待接入项
 
-- **流式读取**：作业脚本已就绪（`scripts/sql/07_streaming_read.sql`，建议 job_name=`streaming_read_job`）。接入步骤：① 提交作业；② 把 `streaming_read_job` 加入 `analysis-sql/01_metrics_view.sql` 白名单；③ 新建 `metrics_streaming_read` 视图（口径见场景 3）。
+- **流式读取**：分析侧已就绪（`01_metrics_view.sql` 白名单已含 `streaming_read_job`，视图见 `analysis-sql/09_streaming_read.sql`）；仅剩提交作业（`scripts/sql/07_streaming_read.sql`，job_name=`streaming_read_job`）并确认指标上报（口径见场景 3）。
 - **流式聚合**：作业脚本已就绪（`scripts/sql/08_streaming_agg.sql`，建议 job_name=`streaming_agg_job`）。接入步骤同上，新建 `metrics_streaming_agg` 视图（口径见场景 4）。
 
 ---

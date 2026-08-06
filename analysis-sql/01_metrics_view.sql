@@ -13,6 +13,9 @@
 --      paimon.last.commit.kind / paimon.level.file.count.L0..L5 / paimon.level.size.bytes.L0..L5。
 --   4) YARN/HDFS 资源采集器            job_name = 'cluster'（采集器打 tags.table='cluster'）
 --      metric_name 如 yarn.allocated.vcores / hdfs.capacity.used.bytes 等，metric_type=YARN/HDFS。
+--   5) 流式读作业（读 Paimon changelog）job_name = 'streaming_read_job'
+--      scripts/sql/07_streaming_read.sql 提交（blackhole sink，只测流读）；与写入作业同管道上报，
+--      同为任务级 '<算子>.<subtask>.<短名>' 按 subtask 分行，分析见 09_streaming_read.sql。
 --
 -- 字段映射：metric_type→source，metric_value(varchar)→DOUBLE，metric_ts(varchar)→BIGINT。
 -- 命名：视图统一建在 RDW_DATA；若 RDW_ODS_FLINK_METRICS 不在 RDW_DATA 库，改下方 FROM 的库名限定。
@@ -32,4 +35,5 @@ SELECT
   host_name,
   etl_dt
 FROM RDW_DATA.RDW_ODS_FLINK_METRICS
-WHERE job_name IN ('DataStreamperf_paimon', 'compaction_job', 'wide_table', 'cluster');
+WHERE job_name IN ('DataStreamperf_paimon', 'compaction_job', 'wide_table', 'cluster',
+                   'streaming_read_job');  -- 流式读作业（07_streaming_read.sql，09 的口径基于它）

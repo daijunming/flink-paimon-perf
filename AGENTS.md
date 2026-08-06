@@ -40,9 +40,9 @@ Maven 多模块工程（根 `pom.xml`，groupId `com.paimonperf`，packaging `po
   `compaction_job`）完成；`07_streaming_read.sql` / `08_streaming_agg.sql` 为可选流式读作业。
 - `scripts/conf/` — 三个 Java 组件的 `.properties.template` 配置模板（含 `${...}` 占位符）。
 - `analysis-sql/` — 组件 f：StarRocks 分析 SQL。视图统一建在 `RDW_DATA` 库，底座是
-  `01_metrics_view.sql`（分钟分桶 + 四个真实 job_name 白名单），其余为
-  `02_four_category_metrics.sql` / `05_health_flags.sql` / `08_checkpoint_health.sql`
-  及各自自包含的 `_test.sql`。
+  `01_metrics_view.sql`（分钟分桶 + 五个真实 job_name 白名单），其余为
+  `02_four_category_metrics.sql` / `05_health_flags.sql` / `08_checkpoint_health.sql` /
+  `09_streaming_read.sql`（流式读性能）及各自自包含的 `_test.sql`。
 - `docs/` — 需求、设计、验证文档（中文）。
 - `.kiro/` — 可移植的 AI 协作护栏**模板套件**（steering toolkit），非本项目的活跃 steering，
   不会被自动加载；其中 `git-commit-language.md` 描述了本仓库沿用的提交信息口径。
@@ -57,6 +57,7 @@ Maven 多模块工程（根 `pom.xml`，groupId `com.paimonperf`，packaging `po
 | `compaction_job` | 独立 compaction 作业（含 Paimon 桥接的 `compactionThreadBusy` / `avgCompactionTime`） |
 | `wide_table` | metadata-collector（`paimon.*` 指标） |
 | `cluster` | resource-collector（`yarn.*` / `hdfs.*` 指标） |
+| `streaming_read_job` | 流式读作业（`scripts/sql/07_streaming_read.sql`，blackhole sink 流读 changelog；任务级指标同写入作业形态，分析见 `analysis-sql/09_streaming_read.sql`） |
 
 ## 三、技术栈
 
@@ -203,7 +204,8 @@ SOURCE 08_checkpoint_health_test.sql;
   `.kiro/specs/paimon-perf-test/` 目录已不存在。
 - **延迟探针未实现**：`LatencyProbe.readMaxEventTime` 是占位实现（抛
   `UnsupportedOperationException`），`ingest.e2e_latency_ms` 从未产出，
-  因此分析 SQL 刻意不做延迟 SLA 判定、也没有读取性能视图（真实拓扑无点查/批 OLAP 作业）。
+  因此分析 SQL 刻意不做延迟 SLA 判定；读取性能仅覆盖流式读（`09_streaming_read.sql`，
+  对应 `streaming_read_job`），点查/批 OLAP 仍无作业、不出视图。
 - 改 Paimon/Hadoop 版本只动根 `pom.xml` 的 `paimon.version` / `hadoop.version`；
   Paimon 系统表列名读取集中在 `PaimonSystemTableMetadataReader`，REST 字段名集中在
   `ResourceMetricParser.parseYarn/parseHdfs`。

@@ -4,11 +4,11 @@ StarRocks 分析 SQL 脚本集,针对既有指标表 `RDW_ODS_FLINK_METRICS`(采
 
 > 若 `RDW_ODS_FLINK_METRICS` 不在 `RDW_DATA` 库,请把 `01_metrics_view.sql` 的 `FROM RDW_DATA.RDW_ODS_FLINK_METRICS` 库名限定改成实际库。
 
-## 真实作业拓扑（2026-07-07 核对）
+## 真实作业拓扑（2026-07-07 核对；streaming_read_job 后续接入）
 
-被测的是"Flink 写入 Paimon"的性能。写入作业为 **write-only**(只写不合并),Compaction 由**独立 paimon action 作业**完成。分析就围绕两件事:**写入作业状况** 与 **Paimon 表状况**,外加 **Compaction 作业开销** 和 **集群资源**。
+被测的是"Flink 写入 Paimon"的性能。写入作业为 **write-only**(只写不合并),Compaction 由**独立 paimon action 作业**完成。分析围绕:**写入作业状况**、**Paimon 表状况**、**Compaction 作业开销**、**集群资源**,以及 **流式读作业状况**（读 Paimon changelog）。
 
-相关指标来自四个 `job_name`(用 `job_name` 区分来源,不要用 `app_id` 过滤):
+相关指标来自五个 `job_name`(用 `job_name` 区分来源,不要用 `app_id` 过滤):
 
 | 来源 | job_name | 说明 | metric_name 形态 |
 |------|----------|------|------------------|
@@ -16,26 +16,30 @@ StarRocks 分析 SQL 脚本集,针对既有指标表 `RDW_ODS_FLINK_METRICS`(采
 | Compaction 作业 | `compaction_job` | 独立作业(普通 Flink 任务 + Paimon 桥接 Compaction Metrics) | Flink 标准指标 + `...compaction.compactionThreadBusy` / `...avgCompactionTime` 等 |
 | Paimon 表元数据 | `wide_table` | 元数据采集器 | `paimon.file.count` / `paimon.level.*.L0..L5` / `paimon.snapshot.*` / `paimon.last.commit.kind` |
 | 集群资源 | `cluster` | YARN/HDFS 采集器(打 `tags.table='cluster'`) | `yarn.*` / `hdfs.*` |
+| 流式读作业 | `streaming_read_job` | 流读 wide_table changelog（blackhole sink，只测流读） | 同为任务级按 subtask 分行：`Source: ...%numRecordsOut`、`%backPressuredTimeMsPerSecond` 等 |
 
 关键约定(也是旧版分析 SQL 的错误来源):
 
 - **按 subtask 求和**:Flink 指标是任务级 `<算子>.<subtask>.<短名>`,并行度=3(subtask 0/1/2)。作业级总量 = 每个 subtask 桶内取累计最大值,再对各 subtask **求和**(不是直接 MAX)。
 - **吞吐 anchor 用"包含"不是"前缀"**:算子链名以 `Source:` 开头,故用 `metric_name LIKE '%ConstraintEnforcer%numRecordsOut'`(旧版 `ConstraintEnforcer%` 前缀匹配不到)。
-- **没有读作业**:Flink 流读 / 关联查询 Paimon 目前不存在,故不产出"读取性能"视图(不留空占位)。
-- **没有真实端到端延迟**:延迟探针 `ingest.e2e_latency_ms` 从未产出(占位抛异常),故不做延迟 SLA 判定。
+- **上报周期 3 分钟**:Flink 作业指标（写入/compaction/流读）每 3 分钟上报一批,相关视图每 3 分钟一行有效数据;吞吐类一律用"相邻桶差分 ÷ 实际间隔秒"（不写死 60,兼容采样缺口）,算出的是窗口平均速率。采集器（`wide_table`/`cluster`）周期 30-60s,不受此限。
+- **读取性能 = 流式读**:流读作业（`streaming_read_job`）分析见 `09_streaming_read.sql`;点查/批 OLAP 仍无作业,不出对应视图（不留空占位）。
+- **没有真实端到端延迟**:延迟探针 `ingest.e2e_latency_ms` 从未产出(占位抛异常),故不做延迟 SLA 判定;数据可见延迟用 `08_checkpoint_health.sql` 的 `commit_interval_sec` 近似。
 - `metric_value` / `metric_ts` 是 **varchar**,视图里 `CAST` 成 DOUBLE / BIGINT。
 
 ## 脚本清单
 
 | 文件 | 内容 |
 |------|------|
-| `01_metrics_view.sql` | 基础视图:字段映射 + 分钟分桶,过滤到四个真实 job_name |
+| `01_metrics_view.sql` | 基础视图:字段映射 + 分钟分桶,过滤到五个真实 job_name |
 | `01_metrics_view_test.sql` | 分钟分桶逻辑验证(自包含临时表) |
 | `02_four_category_metrics.sql` | 观测视图集(见下) |
 | `05_health_flags.sql` | 可读健康标志:L0 堆积 / 反压 / 写速率 vs 合速率 / Compaction 活跃度 |
 | `05_health_flags_test.sql` | 健康标志判定验证(自包含临时表) |
 | `08_checkpoint_health.sql` | 快照推进健康度(snapshot_id 单调 / 停滞 STALL / 过慢 SLOW) |
 | `08_checkpoint_health_test.sql` | 快照停滞检测验证(自包含临时表) |
+| `09_streaming_read.sql` | 流式读性能:流读吞吐 / Source 反压 / 读写对照(消费是否跟得上写入) |
+| `09_streaming_read_test.sql` | 流读差分 + 反压标志 + 读写对照判定验证(自包含临时表) |
 
 `02_four_category_metrics.sql` 内含的视图:
 
@@ -56,6 +60,7 @@ SOURCE 01_metrics_view.sql;              -- 基础视图(其余视图的底座)
 SOURCE 02_four_category_metrics.sql;     -- 观测视图集
 SOURCE 05_health_flags.sql;              -- 依赖 02
 SOURCE 08_checkpoint_health.sql;         -- 依赖 01
+SOURCE 09_streaming_read.sql;            -- 依赖 01、02(metrics_ingest_perf)
 ```
 
 测试 SQL(`_test.sql`)均为**自包含逻辑验证**:建临时表插固定样本、复现判定逻辑、断言、清理,不触碰真实分区表,本地即可执行。
@@ -64,6 +69,7 @@ SOURCE 08_checkpoint_health.sql;         -- 依赖 01
 SOURCE 01_metrics_view_test.sql;      -- 预期:分桶断言 PASS
 SOURCE 05_health_flags_test.sql;      -- 预期:7 个用例全 PASS
 SOURCE 08_checkpoint_health_test.sql; -- 预期:停滞检测断言 PASS
+SOURCE 09_streaming_read_test.sql;    -- 预期:3 个断言全 PASS
 ```
 
 ## 健康标志说明（05_health_flags）
@@ -79,10 +85,18 @@ SOURCE 08_checkpoint_health_test.sql; -- 预期:停滞检测断言 PASS
 
 > 设计取舍:判断"合不过来"看两个直接信号——**L0 堆积**(`l0_flag`)与 **Compaction 线程饱和**(`compaction_flag`),而不是"写速率−合速率"的减法(两者不是同一记录总体,单位不可直接相减)。write_rps 与 compaction_thread_busy 并排给出供人对照。快照推进/停滞另见 `08`。
 
+## 流式读说明（09_streaming_read）
+
+- `metrics_streaming_read`:流读吞吐(`read_rps`,与写入同口径的 subtask 求和差分) + Source 反压(`backPressuredTimeMsPerSecond`,最大/平均) + 繁忙度(`busyTimeMsPerSecond`,反压未上报时的替代),软标志 `read_backpressure_flag`(>500 `READ_BACKPRESSURE` / >100 `ELEVATED`,阈值来自指标地图场景3,可调)。
+- `metrics_read_vs_write`:以写入吞吐为基准的读写对照,`unconsumed_records`(写累计−读累计)趋势扩大 = 消费滞后累积;`consume_status` 四态(`KEEPING_UP`/`LAGGING`/`NO_READ_DATA`/`NO_WRITE_BASELINE`)。
+- 读作业 `scan.mode` 默认(当前快照全量+增量),启动初期 `read_rps` 因追全量冲高,判读时排除追数据阶段。
+- 数据可见延迟/快照停滞不在 09,复用 `08_checkpoint_health`。
+
 ## 依赖前置
 
 - 既有表 `RDW_ODS_FLINK_METRICS`(12 列:etl_dt / metric_id / job_name / app_id / job_id / host_name / container_id / container_rule / metric_name / metric_type / metric_value / metric_ts)。
-- 写入作业(`job_name='DataStreamperf_paimon'`)原生 metrics 已由既有链路上报到该表。
+- 写入作业(`job_name='DataStreamperf_paimon'`)原生 metrics 已由既有链路上报到该表(每 3 分钟一批)。
 - 独立 Compaction 作业(`job_name='compaction_job'`,普通 Flink 任务)已上报 Paimon 桥接的 Compaction Metrics(`compactionThreadBusy` / `avgCompactionTime` 等),按短名后缀匹配。
+- 流式读作业(`job_name='streaming_read_job'`,`scripts/sql/07_streaming_read.sql` 提交)指标经同一既有链路上报;若实际作业名不同,改 `01_metrics_view.sql` 白名单。
 - Paimon 元数据采集器(`job_name='wide_table'`)已运行。
 - YARN/HDFS 资源采集器(`job_name='cluster'`)已运行(见 `resource-collector/DEVELOP.md`;注意其指标 `job_name='cluster'` 已纳入 01 白名单)。

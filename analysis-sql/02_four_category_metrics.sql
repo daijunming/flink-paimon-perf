@@ -9,7 +9,8 @@
 --   Compaction job_name='compaction_job'（独立 paimon action 作业）
 --   Paimon 表  job_name='wide_table'（元数据采集器）
 --   集群资源   job_name='cluster'（YARN/HDFS 采集器）
--- 读取性能（原类别3）：当前无 Flink 读作业 / 关联查询，无数据源，本文件不再产出占位视图。
+-- 读取性能（原类别3）：流式读作业（streaming_read_job）已接入，吞吐/反压/读写对照见
+-- 09_streaming_read.sql；本文件不重复产出。点查/批 OLAP 仍无作业，不出对应视图。
 
 -- ==================== 类别1a：写入吞吐（Requirements 7.1）====================
 -- 源链路算子（含 ConstraintEnforcer）的 numRecordsOut：每个 subtask（=不同 metric_name）取桶内累计最大值，
