@@ -111,6 +111,8 @@ WHERE (job_name = 'cluster'
 GROUP BY time_bucket_minute;
 
 -- ==================== 类别4b：Compaction 作业开销（Requirements 7.4）====================
+-- 注意：现行合并为 crontab 批任务 paimon-compact（几十秒退出），不上报指标，本视图无数据属预期；
+-- 以下口径仅流式常驻 compaction_job 形态有效。
 -- 独立 compaction 作业（job_name='compaction_job'）本质是普通 Flink 任务：既有 Flink 标准指标，
 -- 也有 Paimon 桥接指标（Compaction Metrics）。这里用 Paimon Compaction Metrics 直接度量"合"的开销：
 --   * compactionThreadBusy（0~100）：Compaction 线程繁忙度，接近 100 = 合并近满负荷（合不过来的先兆）

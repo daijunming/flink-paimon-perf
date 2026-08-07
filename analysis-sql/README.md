@@ -13,7 +13,7 @@ StarRocks 分析 SQL 脚本集,针对既有指标表 `RDW_ODS_FLINK_METRICS`(采
 | 来源 | job_name | 说明 | metric_name 形态 |
 |------|----------|------|------------------|
 | 写入作业(write-only) | `DataStreamperf_paimon` | 纯写入,Flink 原生任务级指标,**按 subtask 分行** | `<算子名>.<subtask>.<短名>`,如 `...ConstraintEnforcer[4] -> Map.0.numRecordsOut`、`Writer(write-only) : wide_table.0.checkpointStartDelayNanos` |
-| Compaction 作业 | `compaction_job` | 独立作业(普通 Flink 任务 + Paimon 桥接 Compaction Metrics) | Flink 标准指标 + `...compaction.compactionThreadBusy` / `...avgCompactionTime` 等 |
+| Compaction 作业 | `compaction_job` | 旧流式常驻形态(现行合并为 crontab 批任务 `paimon-compact`,几十秒退出、**无指标上报**) | Flink 标准指标 + `...compaction.compactionThreadBusy` / `...avgCompactionTime` 等(仅流式形态有数据) |
 | Paimon 表元数据 | `wide_table` | 元数据采集器 | `paimon.file.count` / `paimon.level.*.L0..L5` / `paimon.snapshot.*` / `paimon.last.commit.kind` |
 | 集群资源 | `cluster` | YARN/HDFS 采集器(打 `tags.table='cluster'`) | `yarn.*` / `hdfs.*` |
 | 流式读作业 | `streaming_read_job` | 流读 wide_table changelog（blackhole sink，只测流读） | 同为任务级按 subtask 分行：`Source: ...%numRecordsOut`、`%backPressuredTimeMsPerSecond` 等 |
@@ -24,7 +24,7 @@ StarRocks 分析 SQL 脚本集,针对既有指标表 `RDW_ODS_FLINK_METRICS`(采
 - **吞吐 anchor 用"包含"不是"前缀"**:算子链名以 `Source:` 开头,故用 `metric_name LIKE '%ConstraintEnforcer%numRecordsOut'`(旧版 `ConstraintEnforcer%` 前缀匹配不到)。
 - **上报周期 3 分钟**:Flink 作业指标（写入/compaction/流读）每 3 分钟上报一批,相关视图每 3 分钟一行有效数据;吞吐类一律用"相邻桶差分 ÷ 实际间隔秒"（不写死 60,兼容采样缺口）,算出的是窗口平均速率。采集器（`wide_table`/`cluster`）周期 30-60s,不受此限。
 - **读取性能 = 流式读**:流读作业（`streaming_read_job`）分析见 `09_streaming_read.sql`;点查/批 OLAP 仍无作业,不出对应视图（不留空占位）。
-- **没有真实端到端延迟**:延迟探针 `ingest.e2e_latency_ms` 从未产出(占位抛异常),故不做延迟 SLA 判定;数据可见延迟用 `08_checkpoint_health.sql` 的 `commit_interval_sec` 近似。
+- **没有真实端到端延迟**:延迟探针 `ingest.e2e_latency_ms` 从未产出(探针代码已移除),故不做延迟 SLA 判定;数据可见延迟用 `08_checkpoint_health.sql` 的 `commit_interval_sec` 近似。
 - `metric_value` / `metric_ts` 是 **varchar**,视图里 `CAST` 成 DOUBLE / BIGINT。
 
 ## 脚本清单
@@ -96,7 +96,7 @@ SOURCE 09_streaming_read_test.sql;    -- 预期:3 个断言全 PASS
 
 - 既有表 `RDW_ODS_FLINK_METRICS`(12 列:etl_dt / metric_id / job_name / app_id / job_id / host_name / container_id / container_rule / metric_name / metric_type / metric_value / metric_ts)。
 - 写入作业(`job_name='DataStreamperf_paimon'`)原生 metrics 已由既有链路上报到该表(每 3 分钟一批)。
-- 独立 Compaction 作业(`job_name='compaction_job'`,普通 Flink 任务)已上报 Paimon 桥接的 Compaction Metrics(`compactionThreadBusy` / `avgCompactionTime` 等),按短名后缀匹配。
+- 独立 Compaction 作业:现行形态为 crontab 批任务 `paimon-compact`(每 5 分钟一轮、几十秒退出),生命周期短于 3 分钟上报周期,**`metrics_compaction_job` / `compaction_flag` 无数据属预期(查不到 ≠ 没跑)**;仅切回流式常驻 `compaction_job` 时,Paimon 桥接指标(`compactionThreadBusy` / `avgCompactionTime`,按短名后缀匹配)才有数据。合并效果分析口径见 `../docs/写入与合并性能分析.md`。
 - 流式读作业(`job_name='streaming_read_job'`,`scripts/sql/07_streaming_read.sql` 提交)指标经同一既有链路上报;若实际作业名不同,改 `01_metrics_view.sql` 白名单。
 - Paimon 元数据采集器(`job_name='wide_table'`)已运行。
 - YARN/HDFS 资源采集器(`job_name='cluster'`)已运行(见 `resource-collector/DEVELOP.md`;注意其指标 `job_name='cluster'` 已纳入 01 白名单)。

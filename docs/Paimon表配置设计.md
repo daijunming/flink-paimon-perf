@@ -101,3 +101,5 @@ SELECT ... FROM t /*+ OPTIONS(
 4. **批压缩期间的 commit 冲突**：写作业和压缩作业并发提交，Paimon 靠快照隔离和冲突重试处理，正常情况兼容，但 FULL 压缩全表重写窗口长，若遇到频繁冲突重试，观察压缩作业日志中的 conflict 记录。
 
 需要确认的一点：你上游写入是完整 CDC 流还是可能存在部分列更新（partial-update / aggregation 引擎）？这直接决定 changelog-producer 的选择，也影响流读端的正确性。
+
+> 现行写入/合并性能分析口径见 [`写入与合并性能分析.md`](写入与合并性能分析.md)：其读写合并分离设计与现场 crontab 批 compact 形态（每 5 分钟提交一次 BATCH 模式 compact action，跑完即退出）吻合。

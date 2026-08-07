@@ -1,5 +1,10 @@
 # 真实环境兼容性确认
 
+> **归档说明（2026-08-06）**：格式兼容性确认工作已完成，本文档仅作历史参考，
+> 不作为现行工作依据；现行工作路径见 `../README.md`（文档导读）。
+
+> **本文档现行角色**：OGG-JSON 兼容性结论与流式验证方法参考；部署流程以 `scripts/README.md` 与 `scripts/meta-collect/README.md` 为准（作业提交形态详见 `scripts/sql/README.md`），本文不再覆盖。
+
 ## 一、OGG-JSON 格式兼容性
 
 ### ✅ 已确认兼容
@@ -23,19 +28,18 @@ CREATE TEMPORARY TABLE default_catalog.rtp_data.src_pk_cdc (
 
 **我们的 Kafka source 配置**（03_source_kafka.sql）：
 ```sql
-CREATE TEMPORARY TABLE kafka_source (
+CREATE TEMPORARY TABLE default_catalog.default_database.kafka_source (
   pk BIGINT,
   c1_bigint BIGINT,
   ...
   event_time BIGINT
 ) WITH (
   'connector' = 'kafka',
-  'topic' = '${KAFKA_TOPIC}',
+  'topic' = 'src_pref_paimon',
   'properties.bootstrap.servers' = '${KAFKA_BOOTSTRAP_SERVERS}',
-  'properties.group.id' = 'job_paimon_wide_ingest',
-  'scan.startup.mode' = '${SCAN_STARTUP_MODE}',
-  'format' = 'ogg-json',  -- ✅ 与你的 value.format=ogg-json 等价
-  'ogg-json.ignore-parse-errors' = 'true'
+  'properties.group.id' = 'job_pref_paimon',
+  'scan.startup.mode' = 'earliest-offset',
+  'format' = 'ogg-json'  -- ✅ 与你的 value.format=ogg-json 等价
 );
 ```
 
@@ -85,13 +89,13 @@ CREATE TEMPORARY TABLE kafka_source (
 
 ## 二、三级表名结构调整
 
-### ✅ 已更新为真实环境配置
+### ✅ 已对齐真实环境配置
 
 **你的 Paimon 配置**：
 ```sql
 CREATE CATALOG paimon_obs WITH (
   'type' = 'paimon',
-  'warehouse' = 'hdfs:///user/flink_user/paimon'
+  'warehouse' = '${PAIMON_WAREHOUSE}'  -- 仓库内以占位符表示，部署时填真实 HDFS 路径
 );
 
 CREATE DATABASE IF NOT EXISTS paimon_obs.paimon_database;
@@ -99,17 +103,14 @@ CREATE DATABASE IF NOT EXISTS paimon_obs.paimon_database;
 CREATE TABLE IF NOT EXISTS paimon_obs.paimon_database.pk_state_paimon (...);
 ```
 
-**我们的配置（已更新）**：
+**我们的配置（已对齐）**：
 
-| 文件 | 原配置 | 新配置（真实环境） |
+| 文件 | 原配置（模板） | 现行配置（真实环境） |
 |------|--------|-------------------|
 | **01_catalog.sql** | `paimon_cat` catalog | ✅ `paimon_obs` catalog |
-|  | `${PAIMON_WAREHOUSE}` 占位符 | ✅ `hdfs:///user/flink_user/paimon` 硬编码 |
 |  | `paimon_cat.perf` database | ✅ `paimon_obs.paimon_database` |
-| **02_sink_paimon.sql** | `paimon_cat.perf.wide_table` | ✅ `paimon_obs.paimon_database.wide_table` |
+| **02_sink_paimon.sql** | `paimon_cat.perf.wide_table` | ✅ `paimon_obs.paimon_database.wide_table`（bucket=3 固定） |
 | **05_ingest_insert.sql** | `INSERT INTO paimon_cat.perf.wide_table` | ✅ `INSERT INTO paimon_obs.paimon_database.wide_table` |
-| **06_point_lookup.sql** | `LEFT JOIN paimon_cat.perf.wide_table` | ✅ `LEFT JOIN paimon_obs.paimon_database.wide_table` |
-| **07_olap_scan.sql** | `FROM paimon_cat.perf.wide_table` | ✅ `FROM paimon_obs.paimon_database.wide_table` |
 
 ---
 
@@ -163,39 +164,23 @@ kafka-console-consumer \
 ### 步骤4：Flink SQL验证（Preflight建表）
 
 ```bash
-# 1. 创建catalog和database
-flink sql-client -f scripts/sql/01_catalog.sql
+# 1. 执行 preflight 建表（一次性，详见 scripts/sql/README.md）：
+#    - 01_catalog.sql：catalog + database（warehouse 为 ${PAIMON_WAREHOUSE} 占位符，先填真实值）
+#    - 02_sink_paimon.sql：100 列宽表 wide_table（bucket=3 固定）
 
-# 2. 创建Paimon表（100列宽表）
-flink sql-client -f scripts/sql/02_sink_paimon.sql
-
-# 3. 验证表是否创建成功
+# 2. 验证表是否创建成功
 flink sql-client -e "SHOW TABLES IN paimon_obs.paimon_database;"
 # 预期输出：wide_table
 ```
 
 ### 步骤5：启动入湖作业（测试数据）
 
-```bash
-# 修改03_source_kafka.sql的占位符（临时测试）
-cat scripts/sql/03_source_kafka.sql | \
-  sed "s/\${KAFKA_TOPIC}/test_wide_table_ogg/g" | \
-  sed "s/\${KAFKA_BOOTSTRAP_SERVERS}/kafka-broker:9092/g" | \
-  sed "s/\${SCAN_STARTUP_MODE}/earliest-offset/g" \
-  > /tmp/03_source_kafka_test.sql
+写入作业的真实提交形态是**平台 STREAMING 作业**：以 `03_source_kafka.sql` + `05_ingest_insert.sql`
+为 SQL body，配 `job-run-params.json` 的运行参数提交（作业名 `DataStreamperf_paimon`，
+详见 `scripts/sql/README.md`）。
 
-# 修改init_phase1.sql的占位符
-cat scripts/sql/init_phase1.sql | \
-  sed "s/\${BUCKET_NUM}/8/g" | \
-  sed "s/\${SCAN_STARTUP_MODE}/earliest-offset/g" \
-  > /tmp/init_phase1_test.sql
-
-# 启动入湖作业
-flink sql-client \
-  -i /tmp/init_phase1_test.sql \
-  -i /tmp/03_source_kafka_test.sql \
-  -f scripts/sql/05_ingest_insert.sql
-```
+快速验证注意：`03_source_kafka.sql` 的 topic 固定为 `src_pref_paimon`；若步骤1用的是
+独立测试 topic（如 `test_wide_table_ogg`），需先把 03 的 topic 改成该测试 topic 再提交。
 
 ### 步骤6：验证数据写入（基于流式计算）
 
@@ -268,46 +253,30 @@ FROM paimon_obs.paimon_database.wide_table;
 ✅ latest_event_time 持续推进（说明新数据不断写入）
 ```
 
-**方式C：延迟探针观测**（✅ 最直接验证流式性能）
-
-```bash
-# 前提：metadata-collector已启动并产出延迟指标到metrics topic
-kafka-console-consumer --bootstrap-server kafka-broker:9092 \
-  --topic metrics_topic \
-  --from-beginning | grep "ingest.e2e_latency_ms"
-
-# 预期输出（JSON格式，每60秒一条）：
-{"source":"PAIMON_METADATA","metric_name":"ingest.e2e_latency_ms","metric_value":15000.0,"timestamp":1704099700000,...}
-{"source":"PAIMON_METADATA","metric_name":"ingest.e2e_latency_ms","metric_value":18000.0,"timestamp":1704099760000,...}
-{"source":"PAIMON_METADATA","metric_name":"ingest.e2e_latency_ms","metric_value":16500.0,"timestamp":1704099820000,...}
-...
-
-# 验证点：
-✅ 延迟值在合理范围（<180000ms = 3分钟，符合SLA）
-✅ 延迟值随时间变化（说明探针持续工作，流式写入持续进行）
-✅ 延迟值不持续上升（说明无严重积压）
-```
+**方式C（延迟探针观测）：未实现，已移除**。`LatencyProbe` 代码已随清理移除，
+`ingest.e2e_latency_ms` 指标从未产出，端到端延迟
+暂无探针手段，不要按该指标做验证。
 
 **方式D：查看Paimon文件系统**（✅ 离线验证，不干扰流式作业）
 
 ```bash
 # 查看Paimon表目录结构
-hdfs dfs -ls hdfs:///user/flink_user/paimon/paimon_database.db/wide_table/
+hdfs dfs -ls ${PAIMON_WAREHOUSE}/paimon_database.db/wide_table/
 
 # 预期输出：
 drwxr-xr-x   - flink_user supergroup  0 2024-01-01 12:00 bucket-0
 drwxr-xr-x   - flink_user supergroup  0 2024-01-01 12:00 bucket-1
-...
+drwxr-xr-x   - flink_user supergroup  0 2024-01-01 12:00 bucket-2
 drwxr-xr-x   - flink_user supergroup  0 2024-01-01 12:00 manifest
 drwxr-xr-x   - flink_user supergroup  0 2024-01-01 12:00 snapshot
 
 # 查看snapshot数量（每次checkpoint产生一个snapshot）
-hdfs dfs -ls hdfs:///user/flink_user/paimon/paimon_database.db/wide_table/snapshot/ | wc -l
+hdfs dfs -ls ${PAIMON_WAREHOUSE}/paimon_database.db/wide_table/snapshot/ | wc -l
 
 # 预期：snapshot数量持续增长（说明checkpoint正常进行）
 
 # 验证点：
-✅ bucket目录存在（阶段1应有64个bucket，阶段2应有16个）
+✅ bucket目录存在（bucket=3 固定，应有 bucket-0/1/2 三个目录，与 parallelism=3、Kafka 3 分区对齐）
 ✅ snapshot目录有文件（说明至少完成过一次checkpoint）
 ✅ manifest目录有文件（Paimon元数据文件）
 ```
@@ -323,7 +292,7 @@ SELECT COUNT(*) FROM paimon_obs.paimon_database.wide_table;
 -- 1. 读的是静态snapshot快照，看不到流式写入的实时进度
 -- 2. 破坏了"所有测试基于流式计算"的前提
 -- 3. 无法验证流式性能指标（吞吐/延迟/反压）
--- 4. batch模式仅用于OLAP场景（07_olap_scan.sql），不用于验证流式入湖
+-- 4. 本测试现阶段无点查/批 OLAP 作业，batch 模式不属于验证手段
 ```
 
 ### 步骤7：验证DELETE语义（基于流式计算）
@@ -396,7 +365,7 @@ SELECT COUNT(*) AS total_records FROM paimon_obs.paimon_database.wide_table;
 # Compaction时真正删除物理数据
 
 # 查看文件数变化（DELETE触发Compaction）
-hdfs dfs -ls hdfs:///user/flink_user/paimon/paimon_database.db/wide_table/bucket-0/ | wc -l
+hdfs dfs -ls ${PAIMON_WAREHOUSE}/paimon_database.db/wide_table/bucket-0/ | wc -l
 
 # 观察Compaction频率（metadata-collector采集的指标）
 kafka-console-consumer --bootstrap-server kafka-broker:9092 \
@@ -419,135 +388,4 @@ kafka-console-consumer --bootstrap-server kafka-broker:9092 \
 
 ---
 
-## 四、完整部署流程（基于真实环境）
-
-### 前置准备
-
-**已有资源**：
-- ✅ Kafka集群：`kafka-broker:9092`
-- ✅ HDFS Paimon仓库：`hdfs:///user/flink_user/paimon`
-- ✅ Paimon catalog：`paimon_obs`
-- ✅ Paimon database：`paimon_database`
-
-**需创建**：
-- [ ] Kafka topic：`test_wide_table`（测试数据topic）
-- [ ] Kafka topic：`metrics_topic`（指标采集topic，复用现有或新建）
-
-### 阶段1：极限压测
-
-```bash
-# 1. Preflight建表
-flink sql-client -f scripts/sql/01_catalog.sql
-flink sql-client -f scripts/sql/02_sink_paimon.sql
-
-# 2. 启动生成器（不限速）
-cat > data-generator-phase1.properties <<EOF
-account.total=30000000
-update.ratio=0.4
-delete.ratio=0.1
-rate.limit.enabled=false
-kafka.bootstrap=kafka-broker:9092
-kafka.topic=test_wide_table
-EOF
-
-java -jar data-generator/target/data-generator.jar data-generator-phase1.properties &
-
-# 3. 启动入湖作业（阶段1参数：parallelism=32, bucket=64, earliest-offset）
-# 需先用sed替换占位符
-export KAFKA_TOPIC=test_wide_table
-export KAFKA_BOOTSTRAP_SERVERS=kafka-broker:9092
-export SCAN_STARTUP_MODE=earliest-offset
-export BUCKET_NUM=64
-
-cat scripts/sql/init_phase1.sql | \
-  sed "s/\${BUCKET_NUM}/$BUCKET_NUM/g" | \
-  sed "s/\${SCAN_STARTUP_MODE}/$SCAN_STARTUP_MODE/g" \
-  > /tmp/init_phase1.sql
-
-cat scripts/sql/03_source_kafka.sql | \
-  sed "s/\${KAFKA_TOPIC}/$KAFKA_TOPIC/g" | \
-  sed "s/\${KAFKA_BOOTSTRAP_SERVERS}/$KAFKA_BOOTSTRAP_SERVERS/g" | \
-  sed "s/\${SCAN_STARTUP_MODE}/$SCAN_STARTUP_MODE/g" \
-  > /tmp/03_source_kafka.sql
-
-flink sql-client \
-  -i /tmp/init_phase1.sql \
-  -i /tmp/03_source_kafka.sql \
-  -f scripts/sql/05_ingest_insert.sql
-
-# 4. 启动采集器（需修改配置文件为真实环境）
-# metadata-collector.properties:
-#   warehouse=hdfs:///user/flink_user/paimon
-#   database=paimon_database
-#   table=wide_table
-#   kafka.bootstrap=kafka-broker:9092
-
-java -jar metadata-collector/target/metadata-collector.jar metadata-collector.properties &
-java -jar resource-collector/target/resource-collector.jar resource-collector.properties &
-```
-
-### 阶段2：生产模拟
-
-```bash
-# 1. 启动生成器（限速20000 rps）
-cat > data-generator-phase2.properties <<EOF
-account.total=30000000
-update.ratio=0.4
-delete.ratio=0.1
-rate.limit.enabled=true
-rate.limit.rps=20000
-kafka.bootstrap=kafka-broker:9092
-kafka.topic=test_wide_table
-EOF
-
-java -jar data-generator/target/data-generator.jar data-generator-phase2.properties &
-
-# 2. 启动入湖作业（阶段2参数：parallelism=8, bucket=16, latest-offset, checkpoint=60s）
-export SCAN_STARTUP_MODE=latest-offset
-export BUCKET_NUM=16  # 若阶段1已建表，这里无法改bucket，需DROP TABLE重建
-
-cat scripts/sql/init_phase2.sql | \
-  sed "s/\${BUCKET_NUM}/$BUCKET_NUM/g" | \
-  sed "s/\${SCAN_STARTUP_MODE}/$SCAN_STARTUP_MODE/g" \
-  > /tmp/init_phase2.sql
-
-flink sql-client \
-  -i /tmp/init_phase2.sql \
-  -i /tmp/03_source_kafka.sql \
-  -f scripts/sql/05_ingest_insert.sql
-```
-
----
-
-## 五、关键差异总结
-
-| 项 | 原设计（模板） | 真实环境（已调整） |
-|----|---------------|-------------------|
-| **Catalog名** | `paimon_cat` | ✅ `paimon_obs` |
-| **Database名** | `perf` | ✅ `paimon_database` |
-| **Warehouse路径** | `${PAIMON_WAREHOUSE}` 占位符 | ✅ `hdfs:///user/flink_user/paimon` 硬编码 |
-| **Kafka地址** | `${KAFKA_BOOTSTRAP_SERVERS}` 占位符 | 需替换为 `kafka-broker:9092` |
-| **OGG-JSON format** | `format = 'ogg-json'` | ✅ 与你的 `value.format = 'ogg-json'` 完全兼容 |
-| **三级表名** | `catalog.database.table` | ✅ 已全部更新为 `paimon_obs.paimon_database.wide_table` |
-
----
-
-## 六、待办事项
-
-### 立即需要
-
-- [ ] 创建 Kafka topic：`test_wide_table`（测试数据）
-- [ ] 修改采集器配置文件（warehouse/database/table/kafka地址）
-- [ ] 执行步骤3-7快速验证OGG-JSON兼容性
-
-### 正式部署前
-
-- [ ] 创建 Kafka topic：`metrics_topic`（或复用现有）
-- [ ] 配置 YARN RM URL（resource-collector需要）
-- [ ] 配置 HDFS NN URL（resource-collector需要）
-- [ ] 配置 StarRocks 连接信息（分析SQL需要）
-- [ ] 实现编排脚本（自动化变量替换与组件启停）
-
----
-
-**状态**：✅ SQL脚本已更新为真实环境配置，✅ OGG-JSON格式已确认兼容，⚠️ 需真实环境快速验证（步骤3-7）。
+**状态**：✅ OGG-JSON 格式已确认兼容，三级表名已对齐真实环境（`paimon_obs.paimon_database.wide_table`）；⚠️ 步骤1-7 的流式验证需在真实环境执行。

@@ -36,8 +36,9 @@ Maven 多模块工程（根 `pom.xml`，groupId `com.paimonperf`，packaging `po
 - `scripts/sql/` — 组件 b：入湖作业 SQL。**不打 jar**，真实提交形态是"平台 STREAMING 作业
   = SQL body（`03_source_kafka.sql` + `05_ingest_insert.sql`）+ 运行参数 `job-run-params.json`"
   （作业名 `DataStreamperf_paimon`，write-only）；建表 DDL（`01`/`02`）preflight 一次性执行；
-  合并由独立 compaction 作业（`06_compaction_job.sh`，paimon-flink-action `compact`，作业名
-  `compaction_job`）完成；`07_streaming_read.sql` / `08_streaming_agg.sql` 为可选流式读作业。
+  合并由 crontab 周期提交的批式 compact 任务（`06_compaction_job.sh`，paimon-flink-action
+  `compact`，作业名 `paimon-compact`，每 5 分钟一轮、跑完即退出）完成；
+  `07_streaming_read.sql` / `08_streaming_agg.sql` 为可选流式读作业。
 - `scripts/conf/` — 三个 Java 组件的 `.properties.template` 配置模板（含 `${...}` 占位符）。
 - `analysis-sql/` — 组件 f：StarRocks 分析 SQL。视图统一建在 `RDW_DATA` 库，底座是
   `01_metrics_view.sql`（分钟分桶 + 五个真实 job_name 白名单），其余为
@@ -53,14 +54,14 @@ Maven 多模块工程（根 `pom.xml`，groupId `com.paimonperf`，packaging `po
 - `.kiro/` — 可移植的 AI 协作护栏**模板套件**（steering toolkit），非本项目的活跃 steering，
   不会被自动加载；其中 `git-commit-language.md` 描述了本仓库沿用的提交信息口径。
 
-### 真实作业拓扑（分析 SQL 的事实基础，2026-07-07 核对）
+### 真实作业拓扑（分析 SQL 的事实基础，2026-08-06 核对）
 
 指标按 `job_name` 区分来源（不要用 `app_id` 过滤）：
 
 | job_name | 来源 |
 |----------|------|
 | `DataStreamperf_paimon` | 写入作业（write-only，Flink 任务级指标按 subtask 分行，聚合需先桶内取 MAX 再跨 subtask 求和） |
-| `compaction_job` | 独立 compaction 作业（含 Paimon 桥接的 `compactionThreadBusy` / `avgCompactionTime`） |
+| `compaction_job` | 旧流式常驻 compaction 作业（已退役；现行合并是 crontab 批任务 `paimon-compact`，生命周期几十秒、**不上报指标**，该行白名单保留仅为兼容历史数据） |
 | `wide_table` | metadata-collector（`paimon.*` 指标） |
 | `cluster` | resource-collector（`yarn.*` / `hdfs.*` 指标） |
 | `streaming_read_job` | 流式读作业（`scripts/sql/07_streaming_read.sql`，blackhole sink 流读 changelog；任务级指标同写入作业形态，分析见 `analysis-sql/09_streaming_read.sql`） |
@@ -166,12 +167,18 @@ SOURCE 08_checkpoint_health_test.sql;
   测试类命名：`*PropertyTest`（jqwik）、`*Test`（单测）、`*IntegrationTest`（mock 集成）。
 - **本地能验证什么**：编译、纯映射/解析逻辑、mock 下的采集流程与容错。
   **本地不能验证什么**：真实 Paimon 仓库读写、真实 Kafka 投递、真实 YARN/HDFS REST
-  ——这些只能在目标 CDH 集群冒烟（验证清单见 `docs/VALIDATION.md`，注意其部分脚本名已过时）。
+  ——这些只能在目标 CDH 集群冒烟（验证清单见 `docs/开测前检查清单.md`）。
 - **集成测试日志出现 `ERROR ... 采集失败` 是故意触发的容错用例**，
   只要 `BUILD SUCCESS`、`Failures: 0` 即正常。
 - **分析 SQL**：`*_test.sql` 均为自包含逻辑验证（建临时表、插固定样本、复现判定逻辑、
   断言、清理），不依赖真实数据。
-- 属性测试与需求条目的对应关系见 `docs/DELIVERY.md` 第五节（Property 1-14）。
+- 现存测试与验证点（原 `docs/DELIVERY.md` 的 Property 1-14 对照表已随文档删除）：
+  data-generator `RecordFactoryPropertyTest`（宽表 100 列结构、I/U/D 比例、UPDATE/DELETE
+  复用历史主键）、`GeneratorConfigPropertyTest`（配置校验拒绝非法参数）；
+  metadata-collector `MetadataCollectorIntegrationTest`（采集流程与失败隔离）、
+  `MetadataMetricMapperTest`（映射信息守恒）；resource-collector `ResourceMetricParserTest` /
+  `ResourceCollectorIntegrationTest`（REST 解析与采集容错）；common `MetricEnvelopePropertyTest` /
+  `CollectorSchedulerPropertyTest`；analysis-sql 四个 `_test.sql`（分桶/健康标志/checkpoint/流式读）。
 
 ## 七、部署与运行
 
@@ -180,7 +187,8 @@ SOURCE 08_checkpoint_health_test.sql;
 2. 复制 `scripts/conf/*.template` 为真实 `.properties` 并填入占位符值。
 3. Preflight 建表：执行 `01_catalog.sql`、`02_sink_paimon.sql`。
 4. 提交写入作业：SQL body（`03`+`05`）+ `job-run-params.json`，作业名 `DataStreamperf_paimon`。
-5. 提交独立 compaction 作业：`bash 06_compaction_job.sh`（作业名 `compaction_job`）。
+5. 配置合并批任务：把 `06_compaction_job.sh` 挂入 crontab（`*/5` 分钟一轮，BATCH 模式
+   `paimon-compact`，跑完即退出，每轮日志含耗时与退出码）。
 6. 启动 Java 组件：`java -jar data-generator.jar data-generator.properties`、
    `java -jar metadata-collector.jar metadata-collector.properties`、
    `java -jar resource-collector.jar resource-collector.properties`（常驻，Ctrl+C 优雅关闭）。
@@ -209,15 +217,28 @@ SOURCE 08_checkpoint_health_test.sql;
 - **以各目录就近的 README/DEVELOP.md 为准**：`scripts/README.md`、`scripts/sql/README.md`、
   `scripts/conf/README.md`、`analysis-sql/README.md`、`metadata-collector/DEVELOP.md`、
   `resource-collector/DEVELOP.md` 均已对齐真实环境（2026-07-07）。
-- **`docs/DELIVERY.md` 与 `docs/VALIDATION.md` 部分过时**：其中引用的
-  `init_phase{1,2}.sql`、`06_point_lookup.sql`、`07_olap_scan.sql` 已被
-  `job-run-params.json` + `06_compaction_job.sh` + 流式读 `07/08` 取代；
-  `analysis-sql/` 的 `03_sla_check` / `04_baseline_compare` / `05_bottleneck_identify`
-  已移除（可从 git 历史恢复）；`data-generator/DEVELOP.md` 实际不存在；
-  `.kiro/specs/paimon-perf-test/` 目录已不存在。
-- **延迟探针未实现**：`LatencyProbe.readMaxEventTime` 是占位实现（抛
-  `UnsupportedOperationException`），`ingest.e2e_latency_ms` 从未产出，
-  因此分析 SQL 刻意不做延迟 SLA 判定；读取性能仅覆盖流式读（`09_streaming_read.sql`，
+- **合并作业真实形态为 crontab 批任务（2026-08-06 核对）**：现场实际是 crontab 每 5 分钟
+  提交一次 BATCH 模式的 `paimon-compact` action（跑完即退出），`06_compaction_job.sh`
+  已对齐为该形态（旧流式常驻 `compaction_job` 描述退役）。批任务生命周期短于
+  指标上报周期（3 分钟）且作业名不在分析视图白名单，compaction 作业侧指标
+  （`metrics_compaction_job`、`compaction_flag`）在该形态下无数据——查不到 ≠ 没跑；
+  写入/合并的分析口径以 `docs/写入与合并性能分析.md` 为准。
+- **2026-08-06 过期材料清理**：已删除（均可从 git 历史恢复）——`docs/ADAPTATION_*.md` 三件套
+  （12 字段适配的中间态记录）、`docs/Paimon 观测监控参数说明.md` 与
+  `docs/存储层观测执行说明.md`（PoC 阶段文物，采集执行器决策已被现行实现推翻）、
+  `docs/VALIDATION.md`（由 `docs/开测前检查清单.md` 取代）、`docs/DELIVERY.md`
+  （交付清单，测试对照已内嵌至本文档第六节）、`LatencyProbe`（延迟探针占位实现，
+  每周期打 ERROR 日志但永不产出指标）。仍不存在的工件：`init_phase{1,2}.sql`、
+  `06_point_lookup.sql`、`07_olap_scan.sql`、`analysis-sql/` 的 `03_sla_check` /
+  `04_baseline_compare` / `05_bottleneck_identify`、`data-generator/DEVELOP.md`、
+  `.kiro/specs/paimon-perf-test/`。
+- **文档已于 2026-08-06 中文化重命名**（见名知意）：如 `PAIMON_METRICS_COVERAGE.md` →
+  `观测指标地图.md`、`PRE_TEST_CHECKLIST.md` → `开测前检查清单.md`、
+  `paimon-write-compact-analysis.md` → `写入与合并性能分析.md`；通用知识类文档归入
+  `docs/archive/`；文档地图与推进顺序见 `docs/README.md`（导读）。
+- **延迟探针已移除（2026-08-06 清理）**：原 `LatencyProbe` 为占位实现，
+  `ingest.e2e_latency_ms` 从未产出，分析 SQL 不做延迟 SLA 判定（数据可见延迟用
+  `08_checkpoint_health.sql` 的提交间隔近似）；读取性能仅覆盖流式读（`09_streaming_read.sql`，
   对应 `streaming_read_job`），点查/批 OLAP 仍无作业、不出视图。
 - 改 Paimon/Hadoop 版本只动根 `pom.xml` 的 `paimon.version` / `hadoop.version`；
   Paimon 系统表列名读取集中在 `PaimonSystemTableMetadataReader`，REST 字段名集中在

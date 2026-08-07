@@ -49,12 +49,7 @@ public final class MetadataCollectorMain {
                 cfg.warehouse, cfg.database, cfg.table,
                 cfg.kerberosPrincipal, cfg.kerberosKeytab, cfg.krb5Conf);
         MetricsSink sink = new KafkaMetricsSink(cfg.kafkaBootstrap, cfg.kafkaMetricsTopic);
-        
-        // 延迟探针：复用 reader 的 catalog 连接（任务 5.6）
-        LatencyProbe latencyProbe = new LatencyProbe(
-                ((PaimonSystemTableMetadataReader) reader).getCatalog(),
-                cfg.database, cfg.table);
-        
+
         ScheduledCollectorScheduler scheduler = new ScheduledCollectorScheduler();
 
         // 进程退出时优雅关闭：停止调度、flush/close Kafka、关闭 Paimon catalog
@@ -66,7 +61,7 @@ public final class MetadataCollectorMain {
         }, "metadata-collector-shutdown"));
 
         scheduler.runPeriodically(
-                () -> collectOnce(reader, sink, latencyProbe, cfg.table),
+                () -> collectOnce(reader, sink, cfg.table),
                 cfg.collectIntervalSeconds);
 
         // 主线程驻留，采集在调度线程持续运行
@@ -74,12 +69,12 @@ public final class MetadataCollectorMain {
     }
 
     /**
-     * 单次采集：读元数据 + 延迟探针 → 映射指标 → 投递。异常向上抛给调度器的 safeRunOnce 隔离，
+     * 单次采集：读元数据 → 映射指标 → 投递。异常向上抛给调度器的 safeRunOnce 隔离，
      * 保证本次失败不影响后续周期（Property 5，验证 4.5）。
      */
-    static void collectOnce(MetadataReader reader, MetricsSink sink, LatencyProbe latencyProbe, String table) {
+    static void collectOnce(MetadataReader reader, MetricsSink sink, String table) {
         long collectTs = System.currentTimeMillis();
-        
+
         // 1. 采集 Paimon 元数据
         PaimonTableMetadata metadata;
         try {
@@ -89,19 +84,10 @@ public final class MetadataCollectorMain {
             throw new RuntimeException("读取 Paimon 元数据失败: table=" + table, e);
         }
         List<MetricEnvelope> metrics = MetadataMetricMapper.toMetrics(metadata, table, collectTs);
-        
-        // 2. 延迟探针：查 MAX(event_time) 算端到端延迟（Requirements 3.2，任务 5.6）
-        MetricEnvelope latencyMetric = latencyProbe.probe(collectTs);
-        if (latencyMetric != null) {
-            metrics.add(latencyMetric);
-            LOG.info("延迟探针: {}ms (table={})", (long) latencyMetric.getMetricValue(), table);
-        } else {
-            LOG.warn("延迟探针跳过（表为空或查询失败）: table={}", table);
-        }
-        
-        // 3. 投递指标
+
+        // 2. 投递指标
         sink.emit(metrics);
-        LOG.info("元数据采集完成: table={} snapshot={} fileCount={} metrics={} (含延迟探针)",
+        LOG.info("元数据采集完成: table={} snapshot={} fileCount={} metrics={}",
                 table, metadata.getSnapshotId(), metadata.getFileCount(), metrics.size());
     }
 

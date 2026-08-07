@@ -1,5 +1,5 @@
 -- 09_streaming_read.sql —— 场景3：流式读取性能（Flink 流读 Paimon changelog）
--- 口径来源：docs/PAIMON_METRICS_COVERAGE.md 场景3；作业脚本 scripts/sql/07_streaming_read.sql
+-- 口径来源：docs/观测指标地图.md 场景3；作业脚本 scripts/sql/07_streaming_read.sql
 -- （blackhole sink，只测流读本身、不引入 sink 开销），job_name = 'streaming_read_job'
 -- （若实际提交的作业名不同，改 01_metrics_view.sql 白名单即可，本文件不用动）。
 --

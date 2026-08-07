@@ -43,15 +43,9 @@ class MetadataCollectorIntegrationTest {
             }
         };
         RecordingSink sink = new RecordingSink();
-        LatencyProbe mockProbe = new LatencyProbe(null, "perf", "test_table") {
-            @Override
-            public MetricEnvelope probe(long probeTimeMillis) {
-                return null; // 集成测试不测延迟探针，返回null跳过
-            }
-        };
 
         // 执行一次采集
-        MetadataCollectorMain.collectOnce(mockReader, sink, mockProbe, "test_table");
+        MetadataCollectorMain.collectOnce(mockReader, sink, "test_table");
 
         // 验证：sink 收到映射后的指标信封列表
         assertEquals(1, sink.emitted.size(), "应调用一次 emit");
@@ -83,16 +77,10 @@ class MetadataCollectorIntegrationTest {
             }
         };
         RecordingSink sink = new RecordingSink();
-        LatencyProbe mockProbe = new LatencyProbe(null, "perf", "test_table") {
-            @Override
-            public MetricEnvelope probe(long probeTimeMillis) {
-                return null;
-            }
-        };
 
         // reader 抛异常时 collectOnce 向上抛出（RuntimeException 包装）
         RuntimeException ex = assertThrows(RuntimeException.class,
-                () -> MetadataCollectorMain.collectOnce(failingReader, sink, mockProbe, "test_table"));
+                () -> MetadataCollectorMain.collectOnce(failingReader, sink, "test_table"));
         assertTrue(ex.getMessage().contains("读取 Paimon 元数据失败"),
                 "异常消息应指明失败原因");
 
