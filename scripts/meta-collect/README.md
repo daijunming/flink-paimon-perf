@@ -113,6 +113,9 @@ scripts/meta-collect/
   恒单行(无分析价值,为统一多表口径保留);接入分区表需扩展 10_collect_main 的
   `partition` 列逻辑(GROUP BY `partition` 展开)。
 - `$statistics` 的 `colstat` 为复合类型,第一阶段不采集;Paimon 未产出统计的表该 topic 为空。
+- SR 主键字节数限制:files 表主键用 `file_path_md5`(CHAR(32))代理——file_path 含目录、
+  长度不定,直接进主键装载时超限被整批过滤(2026-08-11 现场发生)。主键无法 ALTER,
+  变更需 DROP 重建该表并重建其 Routine Load。
 - Paimon 1.1 的 `$files` **没有 `file_source` 列**(后续版本才有),勿在采集 SQL 中引用。
 - 环境前提:sql-client 能提交 batch 作业(或平台支持 batch SQL);cron 用户持有有效
   Kerberos ticket。每轮 2 个小型 YARN 批作业(单作业 10-30s 量级),

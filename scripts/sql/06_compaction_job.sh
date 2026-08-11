@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# 06_compaction_job.sh —— 独立 Compaction 任务(crontab 周期批形态,对齐真实现場 2026-08-06)
+# 06_compaction_job.sh —— 独立 Compaction 任务(crontab 周期批形态,对齐真实现场;
+# 资源参数 2026-08-11 随现场 crontab 复核更新:JM 2048m / TM 15360m / vcores 6 / slots 3)
+# 参数勘误(2026-08-11):移除 write.merge-max-file-num——Paimon 1.1.1 CoreOptions
+# 无此参数,配置了也被静默忽略;现场 crontab 与写入作业 hint 里的同名参数应一并删除。
 #
 # 真实形态:写入作业(DataStreamperf_paimon)write-only 只写不合;合并由 crontab 每 5 分钟
 # 提交一次的 BATCH 任务完成(paimon-flink-action compact,作业名 paimon-compact),
@@ -28,17 +31,35 @@ TABLE="wide_table"
 
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 
+# flock 防重入:cron 到点必触发、自身不串行化,上一轮跑超 5 分钟时下一轮会重复提交,
+# YARN 应用积压(2026-08-11 现场已发生)。上一轮未结束则本轮直接跳过——compact 是
+# 幂等累积操作,跳过不丢工作,下一轮自然合掉累积的增量。只防本机周期提交相互踩踏,
+# 从别处手工提交不在保护范围。写法与 collect_once.sh 一致。
+LOCK_FILE="${COMPACT_LOCK_FILE:-/tmp/paimon-compact.lock}"
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"${LOCK_FILE}"
+  if ! flock -n 9; then
+    log "上一轮 compact 仍在运行,本轮跳过"
+    exit 0
+  fi
+else
+  log "警告: 无 flock,本轮不防重入(上一轮超时将重复提交)"
+fi
+
 START=$(date +%s)
 log "提交本轮 compact(paimon-compact, BATCH)"
 
+# attached=true:flock 只在脚本进程存活期间有效,客户端必须等作业结束才返回;
+# 顺带让下方的耗时/退出码日志反映作业真实结果,而非提交动作本身。
 if "${FLINK_HOME}/bin/flink" run-application -t yarn-application \
   -Dexecution.runtime-mode=BATCH \
+  -Dexecution.attached=true \
   -Dyarn.application.name=paimon-compact \
-  -Djobmanager.memory.process.size=1536m \
-  -Dtaskmanager.memory.process.size=10240m \
+  -Djobmanager.memory.process.size=2048m \
+  -Dtaskmanager.memory.process.size=15360m \
   -Dyarn.appmaster.vcores=1 \
-  -Dyarn.containers.vcores=4 \
-  -Dtaskmanager.numberOfTaskSlots=4 \
+  -Dyarn.containers.vcores=6 \
+  -Dtaskmanager.numberOfTaskSlots=3 \
   "${PAIMON_ACTION_JAR}" \
   compact \
   --warehouse "${WAREHOUSE}" \
@@ -52,7 +73,6 @@ if "${FLINK_HOME}/bin/flink" run-application -t yarn-application \
   --table-conf write-buffer-size=64m \
   --table-conf num-sorted-run.compaction-trigger=3 \
   --table-conf sink.use-managed-memory-allocator=true \
-  --table-conf write.merge-max-file-num=6 \
   --table-conf sink.parallelism=3 \
   --table-conf parquet.enable.dictionary=false \
   --table-conf read.batch-size=512; then

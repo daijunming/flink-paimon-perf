@@ -83,12 +83,18 @@ PROPERTIES ("replication_num" = "3");
 --    说明:wide_table 为非分区表,partition_value 固定空串;接入分区表时需扩展采集 SQL。
 --    source_snapshot_id 由采集作业内 MAX(snapshot_id) 打标,极小概率跨源误标,
 --    下一轮按正确 snapshot_id 主键覆盖即自愈。
+--    主键用 file_path_md5 而非 file_path(2026-08-11 现场踩坑):SR 限制主键总字节数
+--    (按声明或按内容计,因版本而异),file_path 含 bucket 目录、长度不定,直接进主键
+--    装载时超限被整批过滤;MD5 定长 32 字节且确定,幂等覆盖语义不变,
+--    file_path 保留为普通列供复核。名称列声明同步收紧(16/24/32),
+--    保证按声明长度计时也不超限。
 CREATE TABLE IF NOT EXISTS rdw_ods_paimon_meta_files (
-  catalog_name              VARCHAR(128)  NOT NULL,
-  database_name             VARCHAR(128)  NOT NULL,
-  table_name                VARCHAR(128)  NOT NULL,
+  catalog_name              VARCHAR(16)   NOT NULL,
+  database_name             VARCHAR(24)   NOT NULL,
+  table_name                VARCHAR(32)   NOT NULL,
   source_snapshot_id        BIGINT        NOT NULL COMMENT '本行状态所属的 Snapshot ID',
-  file_path                 VARCHAR(256)  NOT NULL COMMENT 'Paimon 数据文件名',
+  file_path_md5             CHAR(32)      NOT NULL COMMENT 'file_path 的 MD5(hex),代理主键',
+  file_path                 VARCHAR(512)  NULL     COMMENT 'Paimon 数据文件相对路径(含 bucket 目录)',
   collector_run_id          VARCHAR(64)   NULL,
   collected_at              DATETIME      NULL,
   partition_value           VARCHAR(512)  NULL     COMMENT '分区值(非分区表为空串)',
@@ -101,7 +107,7 @@ CREATE TABLE IF NOT EXISTS rdw_ods_paimon_meta_files (
   min_sequence_number       BIGINT        NULL,
   max_sequence_number       BIGINT        NULL,
   creation_time             DATETIME      NULL
-) PRIMARY KEY(catalog_name, database_name, table_name, source_snapshot_id, file_path)
+) PRIMARY KEY(catalog_name, database_name, table_name, source_snapshot_id, file_path_md5)
 COMMENT 'Paimon $files 当前态(每轮采集最新 Snapshot)'
 DISTRIBUTED BY HASH(table_name, source_snapshot_id) BUCKETS 3
 PROPERTIES ("replication_num" = "3");

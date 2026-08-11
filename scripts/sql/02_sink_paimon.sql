@@ -11,7 +11,7 @@
 --   * 表上【不】放写入/compaction 调优选项。真实拓扑是"写入作业 write-only + 独立 compaction 作业"：
 --       - 写入侧参数（write-only=true / sink.parallelism / write-buffer-* 等）由 05_ingest_insert.sql 的
 --         INSERT `/*+ OPTIONS(...) */` 动态 hint 传入；
---       - compaction 调优（compaction-trigger / merge-max-file-num 等）由独立 compaction 作业的
+--       - compaction 调优（num-sorted-run.compaction-trigger 等）由独立 compaction 作业的
 --         --table_conf 传入（见 06_compaction_job.sh）。
 -- 提交方式：preflight 阶段一次性执行（与 01_catalog.sql 一起）。
 

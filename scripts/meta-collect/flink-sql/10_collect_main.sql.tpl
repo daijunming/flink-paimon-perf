@@ -77,6 +77,7 @@ CREATE TEMPORARY TABLE kafka_meta_files (
   table_name              STRING,
   source_snapshot_id      BIGINT,
   file_path               STRING,
+  file_path_md5           STRING,
   collector_run_id        STRING,
   collected_at            STRING,
   partition_value         STRING,
@@ -197,6 +198,7 @@ FROM paimon_obs.paimon_database.`${PAIMON_TABLE}$statistics`;
 -- 注意:Paimon 1.1 的 $files 没有 file_source 列(后续版本才有),不要加。
 -- partition_value:wide_table 为非分区表,固定空串;接入分区表时需扩展此列。
 -- 表从未提交过时 $files 为 0 行,CROSS JOIN 不产生输出行,source_snapshot_id 不会出现 NULL。
+-- file_path_md5:SR 侧 files 表的代理主键(原路径直接进主键超 SR 主键字节限制),必须随行产出。
 INSERT INTO kafka_meta_files
 SELECT
   '${PAIMON_CATALOG}'  AS catalog_name,
@@ -204,6 +206,7 @@ SELECT
   '${PAIMON_TABLE}'    AS table_name,
   s.latest_snapshot_id AS source_snapshot_id,
   f.file_path,
+  MD5(f.file_path) AS file_path_md5,
   '${COLLECTOR_RUN_ID}' AS collector_run_id,
   DATE_FORMAT(CURRENT_TIMESTAMP, 'yyyy-MM-dd HH:mm:ss') AS collected_at,
   '' AS partition_value,

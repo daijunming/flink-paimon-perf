@@ -8,8 +8,10 @@
 --         合并由独立 compaction 作业完成（见 06_compaction_job.sh）。
 --       - sink.parallelism=3、write-buffer-spillable、write-buffer-size、sink.use-managed-memory-allocator、
 --         parquet.enable.dictionary=false、read.batch-size：写入侧内存/格式调优。
---       - num-sorted-run.compaction-trigger / write.merge-max-file-num 在 write-only 下对本作业不生效
---         （合并在 compaction 作业），此处保留仅为与真实作业参数一致。
+--       - num-sorted-run.compaction-trigger 在 write-only 下对本作业不生效（合并在
+--         compaction 作业），此处保留仅为与真实作业参数一致。
+--       - write.merge-max-file-num 已移除：Paimon 1.1.1 CoreOptions 无此参数，
+--         任何作业下都被静默忽略（2026-08-11 查 release-1.1.1 源码核实）。
 --   * 运行参数（parallelism.default=3、checkpoint、mini-batch、not-null-enforcer=ERROR 等）不在本 SQL 里 SET，
 --     而在平台作业的运行参数 JSON（见 job-run-params.json）——这才是真实提交形态。
 
@@ -21,7 +23,6 @@ INSERT INTO paimon_obs.paimon_database.wide_table
   'write-buffer-spillable' = 'true',
   'write-buffer-size' = '64 m',
   'num-sorted-run.compaction-trigger' = '3',
-  'write.merge-max-file-num' = '6',
   'parquet.enable.dictionary' = 'false',
   'read.batch-size' = '512'
 ) */
