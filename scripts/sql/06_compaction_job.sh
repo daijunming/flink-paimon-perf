@@ -5,7 +5,7 @@
 # 无此参数,配置了也被静默忽略;现场 crontab 与写入作业 hint 里的同名参数应一并删除。
 #
 # 真实形态:写入作业(DataStreamperf_paimon)write-only 只写不合;合并由 crontab 每 5 分钟
-# 提交一次的 BATCH 任务完成(paimon-flink-action compact,作业名 paimon-compact),
+# 提交一次的 BATCH Minor 任务完成(paimon-flink-action compact,作业名 paimon-compact),
 # 单轮几十秒跑完即退出。旧描述"流式常驻 compaction_job"已从现场退役。
 #
 # 观测口径(重要):
@@ -58,12 +58,9 @@ if printf '%s' "${APP_LIST}" | grep -q "${APP_NAME}"; then
   log "YARN 上已有未结束的 ${APP_NAME} 应用(运行或排队中),本轮跳过"
   exit 0
 fi
-if [ -z "${APP_LIST}" ]; then
-  log "提示: 未能获取 YARN 应用列表,本轮跳过应用名检查直接提交"
-fi
 
 START=$(date +%s)
-log "提交本轮 compact(${APP_NAME}, BATCH)"
+log "提交本轮 compact(${APP_NAME}, BATCH, strategy=minor, lookup-compact=radical, sorted-run-trigger=5)"
 
 # attached=true:flock 只在脚本进程存活期间有效,客户端必须等作业结束才返回;
 # 顺带让下方的耗时/退出码日志反映作业真实结果,而非提交动作本身。
@@ -73,6 +70,7 @@ if "${FLINK_HOME}/bin/flink" run-application -t yarn-application \
   -Dyarn.application.name="${APP_NAME}" \
   -Djobmanager.memory.process.size=2048m \
   -Dtaskmanager.memory.process.size=15360m \
+  -Dtaskmanager.memory.managed.fraction=0.1 \
   -Dyarn.appmaster.vcores=1 \
   -Dyarn.containers.vcores=6 \
   -Dtaskmanager.numberOfTaskSlots=3 \
@@ -81,13 +79,12 @@ if "${FLINK_HOME}/bin/flink" run-application -t yarn-application \
   --warehouse "${WAREHOUSE}" \
   --database "${DATABASE}" \
   --table "${TABLE}" \
-  --compact_strategy full \
+  --compact_strategy minor \
   --table-conf changelog-producer=lookup \
   --table-conf changelog-producer.row-deduplicate=true \
+  --table-conf lookup-compact=radical \
+  --table-conf num-sorted-run.compaction-trigger=5 \
   --table-conf scan.split-enumerator.batch-size=1 \
-  --table-conf write-buffer-spillable=true \
-  --table-conf write-buffer-size=64m \
-  --table-conf num-sorted-run.compaction-trigger=3 \
   --table-conf sink.use-managed-memory-allocator=true \
   --table-conf sink.parallelism=3 \
   --table-conf parquet.enable.dictionary=false \

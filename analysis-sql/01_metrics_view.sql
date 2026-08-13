@@ -6,8 +6,9 @@
 --      Flink 原生任务级指标，metric_name 形如 '<算子名>.<subtask下标>.<指标短名>'，例如
 --      'Source: kafka_source[3] -> ConstraintEnforcer[4] -> Map.0.numRecordsOut'、
 --      'Writer(write-only) : wide_table.0.checkpointStartDelayNanos'。按 subtask 分行。
---   2) Compaction 作业（独立 paimon action）job_name = 'compaction_job'
---      写入作业只写不合并，合并由该独立作业完成，其 Flink 指标反映 Compaction 开销。
+--   2) Compaction 作业历史口径          job_name = 'compaction_job'
+--      旧流式常驻形态已退役；现行 `paimon-compact` 为几十秒退出的 crontab 批任务且不在白名单，
+--      因此本行只用于查询历史指标，现行合并效果以 meta-collect 表侧元数据为准。
 --   3) Paimon 表元数据采集器          job_name = 'wide_table'（= 被监测表名）
 --      metric_name 如 paimon.file.count / paimon.snapshot.id / paimon.snapshot.time.millis /
 --      paimon.last.commit.kind / paimon.level.file.count.L0..L5 / paimon.level.size.bytes.L0..L5。

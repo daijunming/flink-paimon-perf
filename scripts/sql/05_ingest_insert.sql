@@ -3,13 +3,9 @@
 -- 相同 pk 的 update 由主键表 merge-engine=deduplicate + sequence.field=event_time 去重。
 --
 -- 关键（对齐真实环境）：
---   * 写入参数走 INSERT 的 `/*+ OPTIONS(...) */` 动态 hint（不放在建表 WITH）：
---       - write-only=true：写入作业只写不合并——真实算子名就是 `Writer(write-only) : wide_table`，
---         合并由独立 compaction 作业完成（见 06_compaction_job.sh）。
---       - sink.parallelism=3、write-buffer-spillable、write-buffer-size、sink.use-managed-memory-allocator、
---         parquet.enable.dictionary=false、read.batch-size：写入侧内存/格式调优。
---       - num-sorted-run.compaction-trigger 在 write-only 下对本作业不生效（合并在
---         compaction 作业），此处保留仅为与真实作业参数一致。
+--   * write-only=true 已持久化在表配置中；写入作业只写不合并，合并由独立 Compact Action 完成。
+--   * 写入调优走 INSERT 的 `/*+ OPTIONS(...) */` 动态 hint：sink.parallelism=3、
+--     write-buffer-spillable=true、write-buffer-size=64mb、sink.use-managed-memory-allocator=true。
 --       - write.merge-max-file-num 已移除：Paimon 1.1.1 CoreOptions 无此参数，
 --         任何作业下都被静默忽略（2026-08-11 查 release-1.1.1 源码核实）。
 --   * 运行参数（parallelism.default=3、checkpoint、mini-batch、not-null-enforcer=ERROR 等）不在本 SQL 里 SET，
@@ -17,14 +13,10 @@
 
 INSERT INTO paimon_obs.paimon_database.wide_table
 /*+ OPTIONS(
-  'write-only' = 'true',
   'sink.parallelism' = '3',
-  'sink.use-managed-memory-allocator' = 'true',
   'write-buffer-spillable' = 'true',
-  'write-buffer-size' = '64 m',
-  'num-sorted-run.compaction-trigger' = '3',
-  'parquet.enable.dictionary' = 'false',
-  'read.batch-size' = '512'
+  'write-buffer-size' = '64 mb',
+  'sink.use-managed-memory-allocator' = 'true'
 ) */
 SELECT
   pk,

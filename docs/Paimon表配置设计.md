@@ -1,105 +1,108 @@
-围绕一张paimon表，有三个flink任务，flink 写入，flink action 压缩，flink 读取，写入和读取，都要求流式的进行，压缩按批模式进行
+# Paimon 读、写、合并任务配置基线
 
+本文记录当前现场已确认配置。参数效果仍以目标 CDH 集群的运行结果为准，不把后续调优候选写成现行配置。
 
+## 一、任务拓扑
 
-流式 Writer 持续写入 Paimon
+```text
+DataStreamperf_paimon（STREAMING，Writer 只写不合）
         ↓
-Paimon 暂存最新增量，暂不向 Reader 输出完整变更流
+wide_table（512 Bucket，deduplicate + lookup）
         ↓
-定时启动 BATCH + MINOR Compaction
+paimon-compact（crontab 每 5 分钟提交 BATCH Minor Compact）
         ↓
-Compaction 根据压缩前后的主键状态生成一次规范化 Changelog
-        ↓
-流式 Reader 收到 -U/+U/-D/+I，更新指标
-
-
-
-这三个作业应按如下配置paimon表的相关属性：
-
-这个架构是标准的读写合并分离模式。配置分四层：表级属性、写作业、压缩作业、读作业。
-
-核心原则是表级属性放共性配置，
-作业级用 dynamic options（`/*+ OPTIONS(...) */` 或 action 的 `--table_conf`）覆盖，避免互相干扰。
-
-
-## 一、表级属性（建表时或 ALTER TABLE 设置）
-
-```sql
-CREATE TABLE t (
-    ...
-    PRIMARY KEY (...) NOT ENFORCED
-) WITH (
-    'bucket' = '256',                          -- 按 586G 的量级
-    'changelog-producer' = 'lookup',           -- 关键项，下面解释
-    'snapshot.time-retained' = '2h',           -- 快照保留，需覆盖读作业可能的追赶延迟
-    'snapshot.num-retained.min' = '10',
-    'file.format' = 'parquet',
-    'file.compression' = 'zstd'
-);
+streaming_read_job / streaming_agg_job（可选流式读）
 ```
 
-关键决策点：
-
-**`changelog-producer`**：流读作业如果需要完整的 changelog（含 UPDATE_BEFORE，比如下游做聚合），必须设置。可选值的权衡：
-
-- `lookup`：写入时通过 lookup 生成 changelog，延迟低，但写入端有额外开销。注意 lookup 模式对 compaction 有隐含要求，写作业即使 write-only 也需要 lookup 相关内存。
-- `full-compaction`：changelog 由 full compaction 产生。但你的压缩是批模式定时跑，changelog 时效性等于压缩周期，流读延迟会变成小时级。与你的流式读取需求冲突，除非下游能接受。
-- `input`：仅当上游写入本身是完整 CDC 流（如 canal/debezium 直灌，无部分更新）时可用，开销最小。
-- 不设（none）：流读端自行 normalize，读作业需要大状态节点还原 before 值，代价转移到读侧。
-
-如果上游是 CDC 完整流，选 `input`；否则选 `lookup`。避开 `full-compaction`，它和你的批式压缩节奏绑定后会牺牲读延迟。
-
-**`snapshot.time-retained`**：三个作业共享快照生命周期。流读断流恢复时如果消费的 snapshot 已过期，作业失败。保留时长必须大于读作业最大可能的中断加追赶时间。同时批式压缩产生的大 snapshot 也占存储，不宜留太长，2 小时到 1 天之间按运维能力取。
-
-## 二、写作业（流式，只写不压）
+## 二、表配置
 
 ```sql
-INSERT INTO t /*+ OPTIONS(
+WITH (
+    'bucket' = '512',
+    'merge-engine' = 'deduplicate',
+    'sequence.field' = 'event_time',
+    'changelog-producer' = 'lookup',
+    'changelog-producer.row-deduplicate' = 'true',
     'write-only' = 'true',
-    'write-buffer-size' = '512mb',
-    'sink.parallelism' = '...'
-) */ SELECT ...
+    'snapshot.num-retained.min' = '10'
+)
 ```
 
-- `write-only = true` 是这个架构的核心开关：writer 不做任何 compaction，也不触发 snapshot 过期清理和 `num-sorted-run.stop-trigger` 的写停等待，写入吞吐稳定。
-- 用 dynamic option 而非表属性设置 `write-only`，因为它只对写作业成立，设成表属性会让压缩作业也读到（压缩 action 会忽略它，但语义上放作业级更干净）。
-- 风险点：write-only 后 L0 文件持续堆积，sorted run 无上限增长。如果压缩作业挂掉或周期太长，流读的 merge 代价和文件数会恶化。需要对 `$files` 系统表或 `numSortedRuns` 指标做监控告警。
+- `bucket=512`：按 2 天、2000 条/s 与现场真实 Data Files 规模估算，单 Bucket 约 1GB。Bucket 数与写入并行度分别按存储规模和作业资源确定，不要求相等。
+- `deduplicate + sequence.field=event_time`：同一主键保留 `event_time` 较新的整行；现场必须保证同 PK 的 `event_time` 能表达可靠先后顺序。
+- `lookup + row-deduplicate=true`：Compaction 负责生成完整更新前后 Changelog；值未变化时不生成无意义的 `-U/+U`。
+- `write-only=true`：Writer 跳过 Compaction 与 Snapshot Expiration，合并交给独立 Compact Action。
+- `snapshot.num-retained.min=10`：只规定最少保留数。独立 Compact 是否持续触发清理、读任务需要多长恢复窗口，仍需在现场核实后确定独立清理策略。
 
-## 三、压缩作业（批模式，dedicated）
+## 三、写入任务
+
+```sql
+INSERT INTO paimon_obs.paimon_database.wide_table
+/*+ OPTIONS(
+    'sink.parallelism' = '3',
+    'write-buffer-spillable' = 'true',
+    'write-buffer-size' = '64 mb',
+    'sink.use-managed-memory-allocator' = 'true'
+) */
+SELECT ...
+```
+
+`write-only` 已持久化为表级语义，不在 INSERT Hint 中重复声明。`num-sorted-run.compaction-trigger`、`parquet.enable.dictionary` 和 `read.batch-size` 不属于当前写入任务基线。
+
+写入作业其余 Flink 参数由 `scripts/sql/job-run-params.json` 承载：当前 `parallelism.default=3`、Checkpoint 间隔 3 分钟。
+
+## 四、独立 Compact Action
 
 ```bash
-flink run -D execution.runtime-mode=batch \
-    paimon-flink-action-*.jar compact \
-    --warehouse ... --database ... --table t \
-    --compact_strategy full \
-    --table_conf snapshot.expire.limit=... \
-    --table_conf sink.parallelism=256
+-Dexecution.runtime-mode=BATCH
+-Dexecution.attached=true
+-Djobmanager.memory.process.size=2048m
+-Dtaskmanager.memory.process.size=15360m
+-Dtaskmanager.memory.managed.fraction=0.1
+-Dyarn.appmaster.vcores=1
+-Dyarn.containers.vcores=6
+-Dtaskmanager.numberOfTaskSlots=3
+
+compact \
+  --warehouse "${WAREHOUSE}" \
+  --database "${DATABASE}" \
+  --table "${TABLE}" \
+  --compact_strategy minor \
+  --table-conf changelog-producer=lookup \
+  --table-conf changelog-producer.row-deduplicate=true \
+  --table-conf lookup-compact=radical \
+  --table-conf num-sorted-run.compaction-trigger=5 \
+  --table-conf scan.split-enumerator.batch-size=1 \
+  --table-conf sink.use-managed-memory-allocator=true \
+  --table-conf sink.parallelism=3 \
+  --table-conf parquet.enable.dictionary=false \
+  --table-conf read.batch-size=512
 ```
 
-- 批模式 + 定时调度（外部调度器按周期拉起）。并行度上限受 bucket 数约束，bucket 调到 256 后并行度才有意义。
-- snapshot 过期和 changelog 清理默认由 committer 执行。写作业 write-only 时不做过期，所以过期职责落在压缩作业上，这是隐含耦合：压缩周期决定了过期执行频率。若压缩周期长，可单独跑 `expire_snapshots` procedure 解耦。
-- 策略选择：不必每次 FULL。日常用默认策略（minor 语义）控制 sorted run 数，低峰期再跑 FULL 做读优化，重写量差一个量级。
+当前依据：
 
-## 四、读作业（流式）
+- TM 15GB 已实测解决原来的 GC overhead。
+- `managed.fraction=0.1` 在当前 Heap 压力明显、Managed Memory 实际使用较低的条件下采用；仍需同步观察 Spill 与本地磁盘。
+- `scan.split-enumerator.batch-size=1` 已实测解决 AddSplitEvents 过大。
+- `parquet.enable.dictionary=false` 与 `read.batch-size=512` 用于控制宽字符串表 Compact 的写入和读取内存。
+- `sink.parallelism=3` 是当前可运行基线，不代表最终最优值。
+- `lookup-compact=radical` 明确采用 Lookup 的激进合并策略：每次触发 Compaction 时推动 L0 向高层合并。
+- `num-sorted-run.compaction-trigger=5` 保留 Paimon 1.1 默认值，控制 Universal Compaction 何时选择更大范围的 Sorted Run；在取得 Minor 实测数据前不沿用原来的激进值 3。
 
-```sql
-SELECT ... FROM t /*+ OPTIONS(
-    'scan.mode' = 'latest-full',           -- 或按需 latest / from-timestamp
-    'streaming-read-mode' = 'log',         -- 消费 changelog
-    'scan.snapshot-id' = '...'             -- 恢复场景按需
-) */
-```
+## 五、流式读任务
 
-- 若表设了 `changelog-producer = lookup/input`，流读直接消费 changelog 文件，无需 normalize 节点。
-- `consumer-id`：可选但建议设置（`'consumer-id' = 'my-reader'`）。它让 Paimon 记录该消费者的进度，snapshot 过期时不会删除消费者尚未读到的 snapshot，解决前面说的"读作业中断后 snapshot 被过期"风险。代价是消费者停用后要手动清理，否则 snapshot 永不过期、存储膨胀。设了 consumer-id 就必须配套 `consumer.expiration-time`。
+当前仓库只提供可选的读性能脚本：
 
-## 主要风险点汇总
+- `07_streaming_read.sql`：默认从当前快照全量读取并持续消费后续 Changelog，写入 Blackhole。
+- `08_streaming_agg.sql`：对完整 Changelog 做持续全表聚合。
 
-1. **压缩作业是单点**：write-only 架构下它停了，文件堆积没有任何兜底。监控必须覆盖它的调度成功率和表的 sorted run 数。
-2. **snapshot 过期与流读进度的竞态**：用 consumer-id 或足够长的 `snapshot.time-retained` 二选一兜底，两者都不配则读作业长时间故障后无法恢复。
-3. **changelog-producer 与压缩模式的交互**：确认你选的 producer 不依赖 full compaction 的执行时机。
-4. **批压缩期间的 commit 冲突**：写作业和压缩作业并发提交，Paimon 靠快照隔离和冲突重试处理，正常情况兼容，但 FULL 压缩全表重写窗口长，若遇到频繁冲突重试，观察压缩作业日志中的 conflict 记录。
+读任务尚未形成生产恢复基线；`consumer-id`、`consumer.expiration-time`、明确的 `scan.mode` 与允许的最大停机恢复窗口仍是待确认项。本阶段不擅自补入运行配置。
 
-需要确认的一点：你上游写入是完整 CDC 流还是可能存在部分列更新（partial-update / aggregation 引擎）？这直接决定 changelog-producer 的选择，也影响流读端的正确性。
+## 六、现场验收
 
-> 现行写入/合并性能分析口径见 [`写入与合并性能分析.md`](写入与合并性能分析.md)：其读写合并分离设计与现场 crontab 批 compact 形态（每 5 分钟提交一次 BATCH 模式 compact action，跑完即退出）吻合。
+1. 对同一 PK 写入确定的 `I → U → 相同值 U → U → D` 样本。
+2. 运行一次 `paimon-compact`，确认 YARN 状态成功且脚本退出码为 0。
+3. 在 `$snapshots` 核对 `COMPACT` 提交和 `changelog_record_count`。
+4. 用流读任务核对实际 RowKind，确认相同值更新被过滤，普通更新具备旧值和新值，删除语义正确。
+5. 在 `$files` 核对 Minor 前后的 L0 数量、最老 L0 文件年龄、文件大小分布和每 Bucket 有效体积；Minor 不要求每轮把 L0 清零，但多轮后应收敛。
+6. 观察 Snapshot 数量与磁盘占用是否持续回落；未回落时再部署独立 Snapshot/Changelog 清理任务。

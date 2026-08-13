@@ -4,14 +4,17 @@
 -- 合计 1+20+20+49+10 = 100 列业务字段 + event_time，主键 pk。
 --
 -- 关键（对齐真实环境）：
---   * bucket = 3（固定）：与写入作业 parallelism=3、Kafka 3 分区对齐。不再是 ${BUCKET_NUM} 变量，
---     也不是旧脚本臆想的 63/15——Flink SQL 的 SET 变量注入本就不生效，且真实就是 3。
+--   * bucket = 512（固定）：按 2 天、2000 条/s 与现场真实 Data Files 规模估算，
+--     单 Bucket 约 1GB；不再通过无效的 ${BUCKET_NUM} 变量注入。
 --   * merge-engine=deduplicate + sequence.field=event_time：高频 update 时同一 pk 按 event_time 毫秒"新值胜出"。
---   * changelog-producer=input，snapshot.num-retained.min=10。
---   * 表上【不】放写入/compaction 调优选项。真实拓扑是"写入作业 write-only + 独立 compaction 作业"：
---       - 写入侧参数（write-only=true / sink.parallelism / write-buffer-* 等）由 05_ingest_insert.sql 的
+--   * changelog-producer=lookup + row-deduplicate=true：由 Compaction 生成完整变更，
+--     值未变化时不产生无意义的 -U/+U。
+--   * write-only=true：Writer 跳过 Compaction 与 Snapshot Expiration，合并交给独立 Compact Action。
+--   * snapshot.num-retained.min=10 只规定最少保留数；清理是否持续生效需结合 Compact 提交核实。
+--   * 作业级调优不放表上：
+--       - 写入侧参数（sink.parallelism / write-buffer-* 等）由 05_ingest_insert.sql 的
 --         INSERT `/*+ OPTIONS(...) */` 动态 hint 传入；
---       - compaction 调优（num-sorted-run.compaction-trigger 等）由独立 compaction 作业的
+--       - compaction 调优由独立 compaction 作业的
 --         --table_conf 传入（见 06_compaction_job.sh）。
 -- 提交方式：preflight 阶段一次性执行（与 01_catalog.sql 一起）。
 
@@ -41,9 +44,11 @@ CREATE TABLE IF NOT EXISTS paimon_obs.paimon_database.wide_table (
   event_time BIGINT,
   PRIMARY KEY (pk) NOT ENFORCED
 ) WITH (
-  'bucket' = '3',
+  'bucket' = '512',
   'merge-engine' = 'deduplicate',
   'sequence.field' = 'event_time',
-  'changelog-producer' = 'input',
+  'changelog-producer' = 'lookup',
+  'changelog-producer.row-deduplicate' = 'true',
+  'write-only' = 'true',
   'snapshot.num-retained.min' = '10'
 );

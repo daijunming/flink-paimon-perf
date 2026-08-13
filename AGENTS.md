@@ -154,13 +154,15 @@ SOURCE 09_streaming_read_test.sql;
 
 - **不用 SQL `SET` 做变量注入**（Flink SQL 不生效）；运行参数（parallelism/checkpoint/
   `table.exec.*` 等）放 `job-run-params.json`，由平台作业配置承载。
-- 写入参数（`write-only=true` 等）经 INSERT 的 `/*+ OPTIONS() */` 动态 hint 传入，
-  **不**写进建表 WITH；compaction 参数放 compaction 作业的 `--table_conf`。
+- `write-only=true`、`changelog-producer=lookup` 与 `row-deduplicate=true` 是表级语义，
+  写入缓冲/并行度走 INSERT 的 `/*+ OPTIONS() */` 动态 hint；compaction 调优放 Action 的 `--table_conf`。
 - 表结构事实：`wide_table` = `pk` + c1..c20 BIGINT + c21..c40 DECIMAL(20,4) +
   c41..c89 STRING + c90..c99 BIGINT（epoch 毫秒）+ `event_time` BIGINT；
-  **bucket=3 固定**（与 parallelism=3、Kafka 3 分区对齐）；
+  **bucket=512 固定**（按 2 天、2000 条/s 与现场真实 Data Files 规模估算，单 Bucket 约 1GB）；
+  写入 parallelism=3 继续与 Kafka 3 分区对齐，不要求与 Bucket 数相等；
   `merge-engine=deduplicate` + `sequence.field=event_time`（同 pk 新值胜出）+
-  `changelog-producer=input`。source/sink/INSERT 三处 100 列定义必须严格对齐。
+  `changelog-producer=lookup` + `changelog-producer.row-deduplicate=true` + `write-only=true`。
+  source/sink/INSERT 三处 100 列定义必须严格对齐。
 - 源格式为 **ogg-json**（op_type=I/U/D）；DELETE 记录只含 pk + event_time，业务列缺失是正常设计。
 
 ## 六、测试策略
@@ -209,7 +211,7 @@ SOURCE 09_streaming_read_test.sql;
   `${PAIMON_WAREHOUSE}`、`${YARN_RM_URL}`、`${HDFS_NN_URL}`。
   部署时复制模板手工填入或由编排脚本 `sed` 替换。
 - **逻辑值保留真实**（非敏感）：catalog `paimon_obs`、database `paimon_database`、
-  table `wide_table`、topic `src_pref_paimon`、group `job_pref_paimon`、bucket=3。
+  table `wide_table`、topic `src_pref_paimon`、group `job_pref_paimon`、bucket=512。
 - 已删除失效占位符 `${BUCKET_NUM}` / `${SCAN_STARTUP_MODE}`（`SET` 变量注入不生效），
   不要重新引入。
 - metadata-collector 含 Kerberos 支持（`KerberosAuthenticator`）；密钥/keytab 不进仓库。

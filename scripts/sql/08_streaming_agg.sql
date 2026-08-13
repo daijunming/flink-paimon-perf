@@ -2,7 +2,8 @@
 -- 目的：以流模式对 wide_table 做全表 running 聚合（COUNT/AVG/SUM/MAX）,
 --   观测持续聚合的状态开销与更新延迟,以及与写入作业并发时的相互影响。
 -- 说明：
---   * 主键表 + changelog-producer=input → 流读产出变更流；无 GROUP BY 的全局聚合维护单行
+--   * 主键表 + changelog-producer=lookup → 流读消费 Compaction 产生的完整变更流；
+--     无 GROUP BY 的全局聚合维护单行
 --     running 结果,随上游 +I/-U/+U/-D 持续更新,并向下游发出更新（retract）流。
 --   * scan.mode 默认读全量 + 续读,故 COUNT 等反映全表当前值 + 持续变化；
 --       只统计新增 → 给 source 加 /*+ OPTIONS('scan.mode'='latest') */。

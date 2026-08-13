@@ -3,7 +3,7 @@
   "_notes": {
     "not-null-enforcer": "平台运行参数为 ERROR（权威）；旧 05 脚本里 SET 的是 DROP，已弃用，以此处 ERROR 为准。",
     "upsert-materialize": "旧 05 脚本另 SET 过 table.exec.sink.upsert-materialize=NONE；若需保留该优化，加到下面 jobRunningParams 即可（原始平台参数未包含）。",
-    "parallelism_bucket": "parallelism.default=3 与表 bucket=3、Kafka 3 分区对齐。",
+    "parallelism_bucket": "parallelism.default=3 与当前 Kafka 3 分区对齐；表 bucket=512 独立按 Data Files 规模确定，不要求与作业并行度相等。",
     "metrics": "metrics.reporter.kafka.filter.includes=* → 全量指标上报到 RDW_ODS_FLINK_METRICS，供 analysis-sql 使用。"
   },
   "taskName": "DataStreamperf_paimon",
