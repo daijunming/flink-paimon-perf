@@ -81,6 +81,8 @@ scripts/meta-collect/
 │  └─ 20_collect_sampling.sql.tpl     # consumers + options 按时间采样
 ├─ conf/meta-collect.properties.template  # 配置模板(占位符见 scripts/README.md 约定)
 ├─ bin/collect_once.sh                # 单轮编排:渲染模板 → 提交 → 记 runs
+│   (运行期生成 state/rendered/*.sql:渲染产物供复核,默认保留 3 天自动清理,
+│     RENDERED_RETENTION_DAYS 可调)
 └─ README.md(本文件)
 ```
 

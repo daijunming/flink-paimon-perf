@@ -28,13 +28,18 @@ PAIMON_ACTION_JAR="${PAIMON_ACTION_JAR:-${FLINK_HOME}/task/paimon-flink-action-1
 WAREHOUSE="${PAIMON_WAREHOUSE:?请设置 PAIMON_WAREHOUSE,如 hdfs:///user/<user>/paimon}"
 DATABASE="paimon_database"
 TABLE="wide_table"
+APP_NAME="paimon-compact"
 
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 
-# flock 防重入:cron 到点必触发、自身不串行化,上一轮跑超 5 分钟时下一轮会重复提交,
+# 防重入两层:cron 到点必触发、自身不串行化,上一轮跑超 5 分钟时下一轮会重复提交,
 # YARN 应用积压(2026-08-11 现场已发生)。上一轮未结束则本轮直接跳过——compact 是
-# 幂等累积操作,跳过不丢工作,下一轮自然合掉累积的增量。只防本机周期提交相互踩踏,
-# 从别处手工提交不在保护范围。写法与 collect_once.sh 一致。
+# 幂等累积操作,跳过不丢工作,下一轮自然合掉累积的增量。
+#   1. flock:防本机周期提交相互踩踏(写法与 collect_once.sh 一致);
+#   2. YARN 应用名检查:兜底 flock 覆盖不到的同源路径——attached 客户端异常退出
+#      (断连/进程被杀/RM 抖动)时 YARN 应用仍在跑,但脚本进程结束、flock 随之释放,
+#      下一轮 cron 会再提交一个。已有未结束的同名应用(运行或排队)时本轮跳过。
+# 注意:若旧应用卡死,此后每轮都会在第二层跳过并留日志,需人工 kill 该应用恢复。
 LOCK_FILE="${COMPACT_LOCK_FILE:-/tmp/paimon-compact.lock}"
 if command -v flock >/dev/null 2>&1; then
   exec 9>"${LOCK_FILE}"
@@ -46,15 +51,26 @@ else
   log "警告: 无 flock,本轮不防重入(上一轮超时将重复提交)"
 fi
 
+# 第二层防重:YARN 应用名检查(-list 默认只列 NEW/SUBMITTED/ACCEPTED/RUNNING 未结束应用)。
+# 查询失败(空输出)放行并提示——RM 真故障时下方提交动作本身会失败暴露。
+APP_LIST="$(yarn application -list 2>/dev/null || true)"
+if printf '%s' "${APP_LIST}" | grep -q "${APP_NAME}"; then
+  log "YARN 上已有未结束的 ${APP_NAME} 应用(运行或排队中),本轮跳过"
+  exit 0
+fi
+if [ -z "${APP_LIST}" ]; then
+  log "提示: 未能获取 YARN 应用列表,本轮跳过应用名检查直接提交"
+fi
+
 START=$(date +%s)
-log "提交本轮 compact(paimon-compact, BATCH)"
+log "提交本轮 compact(${APP_NAME}, BATCH)"
 
 # attached=true:flock 只在脚本进程存活期间有效,客户端必须等作业结束才返回;
 # 顺带让下方的耗时/退出码日志反映作业真实结果,而非提交动作本身。
 if "${FLINK_HOME}/bin/flink" run-application -t yarn-application \
   -Dexecution.runtime-mode=BATCH \
   -Dexecution.attached=true \
-  -Dyarn.application.name=paimon-compact \
+  -Dyarn.application.name="${APP_NAME}" \
   -Djobmanager.memory.process.size=2048m \
   -Dtaskmanager.memory.process.size=15360m \
   -Dyarn.appmaster.vcores=1 \

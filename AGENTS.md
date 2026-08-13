@@ -28,8 +28,8 @@ Maven 多模块工程（根 `pom.xml`，groupId `com.paimonperf`，packaging `po
 |------|------|------|------|
 | `common/` | 公共工具：`MetricEnvelope`（指标信封，对齐 `RDW_ODS_FLINK_METRICS` 12 字段）、`CollectorScheduler`、`KafkaMetricsSink` 等 | 普通 jar（不打 fat jar） | — |
 | `data-generator/` | 组件 a：Kafka 测试数据生成器。生成 100 列宽表记录（OGG-JSON，op_type=I/U/D），UPDATE/DELETE 复用历史主键，可选令牌桶限速 | shaded fat jar `data-generator.jar`（约 15 MB） | `com.paimonperf.generator.GeneratorMain` |
-| `metadata-collector/` | 组件 c：Paimon 元数据采集器（快照号/文件数/Level 分布/commit kind），含端到端延迟探针 | shaded fat jar `metadata-collector.jar`（约 107 MB，含 paimon-bundle + hadoop-client） | `com.paimonperf.metadata.MetadataCollectorMain` |
-| `resource-collector/` | 组件 d：YARN/HDFS 资源采集器（JDK 内置 HTTP 调 REST，无 Hadoop 依赖） | shaded fat jar `resource-collector.jar`（约 15 MB） | `com.paimonperf.resource.ResourceCollectorMain` |
+| `metadata-collector/` | 组件 c：Paimon 元数据采集器（快照号/文件数/Level 分布/commit kind）。**2026-08-11 现场退役**（代码保留、可构建可测试），无新数据；表侧元数据由 meta-collect ODS 承载 | shaded fat jar `metadata-collector.jar`（约 107 MB，含 paimon-bundle + hadoop-client） | `com.paimonperf.metadata.MetadataCollectorMain` |
+| `resource-collector/` | 组件 d：YARN/HDFS 资源采集器（JDK 内置 HTTP 调 REST，无 Hadoop 依赖）。**2026-08-11 现场退役**（代码保留、可构建可测试），无新数据、无替代通路 | shaded fat jar `resource-collector.jar`（约 15 MB） | `com.paimonperf.resource.ResourceCollectorMain` |
 
 ### 资源目录（非 Maven 模块）
 
@@ -49,7 +49,8 @@ Maven 多模块工程（根 `pom.xml`，groupId `com.paimonperf`，packaging `po
   当前态（作业内 `MAX(snapshot_id)` 打标），经 Kafka（topic 名与 SR 表一致：
   `rdw_ods_paimon_meta_*`）由 Routine Load 进 StarRocks ODS 层（`RDW_DATA.rdw_ods_paimon_meta_*`，
   只存可复核事实，健康结论由分析层计算；PRIMARY KEY 主键覆盖保证幂等，无本地游标）。
-  与 metadata-collector **并存**：那是聚合指标通路，这是行级历史通路。详见其 README.md。
+  原与 metadata-collector **并存**（聚合指标通路 vs 行级历史通路）；后者 2026-08-11 退役后，
+  本目录成为唯一表侧元数据通路（analysis-sql 02/05/08 的表侧信号已改接这里）。详见其 README.md。
 - `docs/` — 需求、设计、验证文档（中文）。
 - `.kiro/` — 可移植的 AI 协作护栏**模板套件**（steering toolkit），非本项目的活跃 steering，
   不会被自动加载；其中 `git-commit-language.md` 描述了本仓库沿用的提交信息口径。
@@ -60,10 +61,10 @@ Maven 多模块工程（根 `pom.xml`，groupId `com.paimonperf`，packaging `po
 
 | job_name | 来源 |
 |----------|------|
-| `DataStreamperf_paimon` | 写入作业（write-only，Flink 任务级指标按 subtask 分行，聚合需先桶内取 MAX 再跨 subtask 求和） |
+| `DataStreamperf_paimon` | 写入作业（write-only，Flink 任务级指标按 subtask 分行；同一指标存在任务级链名/算子级名双粒度重复上报、计数相同（2026-08-12 核实），聚合需桶内取 MAX → 单算子内跨 subtask 求和 → 跨算子取 MAX 去重，不可直接 SUM） |
 | `compaction_job` | 旧流式常驻 compaction 作业（已退役；现行合并是 crontab 批任务 `paimon-compact`，生命周期几十秒、**不上报指标**，该行白名单保留仅为兼容历史数据） |
-| `wide_table` | metadata-collector（`paimon.*` 指标） |
-| `cluster` | resource-collector（`yarn.*` / `hdfs.*` 指标） |
+| `wide_table` | metadata-collector（`paimon.*` 指标）。**2026-08-11 现场退役**（代码保留可构建），无新数据；白名单保留仅为兼容历史数据，表侧元数据由 meta-collect ODS 承载 |
+| `cluster` | resource-collector（`yarn.*` / `hdfs.*` 指标）。**2026-08-11 现场退役**（代码保留可构建），无新数据、无替代通路；白名单保留仅为兼容历史数据 |
 | `streaming_read_job` | 流式读作业（`scripts/sql/07_streaming_read.sql`，blackhole sink 流读 changelog；任务级指标同写入作业形态，分析见 `analysis-sql/09_streaming_read.sql`） |
 
 ## 三、技术栈
@@ -116,8 +117,10 @@ SOURCE 08_checkpoint_health.sql;      -- 依赖 01
 
 -- 逻辑验证（自包含临时表，不触碰真实分区表，本地即可执行）
 SOURCE 01_metrics_view_test.sql;
+SOURCE 02_four_category_metrics_test.sql;
 SOURCE 05_health_flags_test.sql;
 SOURCE 08_checkpoint_health_test.sql;
+SOURCE 09_streaming_read_test.sql;
 ```
 
 ## 五、代码风格与设计约定
@@ -178,26 +181,25 @@ SOURCE 08_checkpoint_health_test.sql;
   metadata-collector `MetadataCollectorIntegrationTest`（采集流程与失败隔离）、
   `MetadataMetricMapperTest`（映射信息守恒）；resource-collector `ResourceMetricParserTest` /
   `ResourceCollectorIntegrationTest`（REST 解析与采集容错）；common `MetricEnvelopePropertyTest` /
-  `CollectorSchedulerPropertyTest`；analysis-sql 四个 `_test.sql`（分桶/健康标志/checkpoint/流式读）。
+  `CollectorSchedulerPropertyTest`；analysis-sql 五个 `_test.sql`（分桶/写入吞吐跨算子去重/健康标志/checkpoint/流式读）。
 
 ## 七、部署与运行
 
-1. 外网构建机 `mvn clean package -DskipTests`，把三个 fat jar + `scripts/` +
-   `analysis-sql/` 搬运到离线集群。
+1. 外网构建机 `mvn clean package -DskipTests`，把 `data-generator.jar` + `scripts/` +
+   `analysis-sql/` 搬运到离线集群（metadata/resource 两采集器 2026-08-11 退役，无需搬运）。
 2. 复制 `scripts/conf/*.template` 为真实 `.properties` 并填入占位符值。
 3. Preflight 建表：执行 `01_catalog.sql`、`02_sink_paimon.sql`。
 4. 提交写入作业：SQL body（`03`+`05`）+ `job-run-params.json`，作业名 `DataStreamperf_paimon`。
 5. 配置合并批任务：把 `06_compaction_job.sh` 挂入 crontab（`*/5` 分钟一轮，BATCH 模式
    `paimon-compact`，跑完即退出，每轮日志含耗时与退出码）。
-6. 启动 Java 组件：`java -jar data-generator.jar data-generator.properties`、
-   `java -jar metadata-collector.jar metadata-collector.properties`、
-   `java -jar resource-collector.jar resource-collector.properties`（常驻，Ctrl+C 优雅关闭）。
+6. 启动生成器：`java -jar data-generator.jar data-generator.properties`（常驻，Ctrl+C 优雅关闭）。
 7. StarRocks 侧按第四节顺序执行分析 SQL 观测。
-8. （可选）行级元数据历史：按 `scripts/meta-collect/README.md` 部署（SR 建表 + Routine Load
-   + `meta-collect.properties` + crontab 每 3 分钟 `collect_once.sh`）。
+8. 表侧元数据通路（两采集器退役后为必选）：按 `scripts/meta-collect/README.md` 部署
+   （SR 建表 + Routine Load + `meta-collect.properties` + crontab 每 3 分钟 `collect_once.sh`）；
+   analysis-sql 02/05/08 的表侧信号依赖这里的 ODS 表与视图。
 
-阶段化差异（生成器/采集器配置）：阶段1 `rate.limit.enabled=false`（不限速探上限）、
-采集周期 30s；阶段2 `rate.limit.enabled=true` + `rate.limit.rps=20000`、采集周期 60s。
+阶段化差异（生成器配置）：阶段1 `rate.limit.enabled=false`（不限速探上限）；
+阶段2 `rate.limit.enabled=true` + `rate.limit.rps=20000`。
 编排脚本（env.sh / preflight.sh / start-*.sh / stop-all.sh，任务 9）尚未实现。
 
 ## 八、安全与脱敏约定
@@ -223,6 +225,15 @@ SOURCE 08_checkpoint_health_test.sql;
   指标上报周期（3 分钟）且作业名不在分析视图白名单，compaction 作业侧指标
   （`metrics_compaction_job`、`compaction_flag`）在该形态下无数据——查不到 ≠ 没跑；
   写入/合并的分析口径以 `docs/写入与合并性能分析.md` 为准。
+- **两个 Java 采集器已现场退役（2026-08-11）**：metadata-collector（job_name='wide_table'）
+  与 resource-collector（job_name='cluster'）停止部署运行、无新数据（代码保留、可构建可测试）。
+  analysis-sql 的表侧信号已改接 meta-collect ODS（`rdw_ods_paimon_meta_*` /
+  `v_paimon_meta_level_stats`）：02 的 `metrics_update_delete_eff` 与 08 的
+  `checkpoint_health` 改用快照表，05 的 `health_flags` 表侧列改用 level 汇总视图并移除
+  `compaction_flag` 等三列；02 的 `metrics_resource_compaction` 视图已删除
+  （yarn/hdfs 资源信号无替代，随之退役）。`docs/观测指标地图.md`、`docs/开测前检查清单.md`、
+  `docs/测试报告模板.md`、`scripts/README.md`、`scripts/conf/README.md` 中仍有按两采集器
+  在线编写的段落，未逐一更新，阅读时以本条为准。
 - **2026-08-06 过期材料清理**：已删除（均可从 git 历史恢复）——`docs/ADAPTATION_*.md` 三件套
   （12 字段适配的中间态记录）、`docs/Paimon 观测监控参数说明.md` 与
   `docs/存储层观测执行说明.md`（PoC 阶段文物，采集执行器决策已被现行实现推翻）、

@@ -1,5 +1,9 @@
 # YARN/HDFS 资源采集器 — 本地开发指导
 
+> **⚠️ 已退役（2026-08-11）**：本采集器已停止在现场部署运行，不再产生新数据
+> （`RDW_ODS_FLINK_METRICS` 中 job_name='cluster' 的 `yarn.*` / `hdfs.*` 指标仅有历史数据），
+> 资源信号无替代通路、随之退役。代码保留、可构建可测试；本文档以下内容为历史开发参考。
+
 > 组件 d：周期调用 YARN / HDFS REST API 采集 CPU/内存/存储指标，
 > 封装为统一指标信封发往既有 Kafka metrics topic，由既有 Flink→StarRocks 链路落表。
 

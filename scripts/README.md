@@ -11,7 +11,7 @@ scripts/
 │  ├─ 02_sink_paimon.sql       # 创建 100 列主键宽表（bucket=3, deduplicate）
 │  ├─ 03_source_kafka.sql      # Kafka source 临时表（topic src_pref_paimon, ogg-json）
 │  ├─ 05_ingest_insert.sql     # write-only INSERT（/*+ OPTIONS() */ hint 传写入参数）
-│  ├─ 06_compaction_job.sh     # 独立 compaction 作业（paimon-flink-action compact）
+│  ├─ 06_compaction_job.sh     # 独立 compaction 作业（paimon-flink-action compact；flock + YARN 应用名双防重）
 │  ├─ 07_streaming_read.sql    # 流式读取 changelog（读性能，可选）
 │  ├─ 08_streaming_agg.sql     # 流式全表持续聚合（读性能，可选）
 │  ├─ job-run-params.json      # 写入作业真实运行参数（parallelism=3 / ckpt 3min / …）
@@ -25,7 +25,7 @@ scripts/
 │  ├─ sr/                      # StarRocks 历史表 DDL + 派生视图 + Routine Load
 │  ├─ flink-sql/               # 采集 SQL 模板（00 latest / 10 主采集 / 20 consumers）
 │  ├─ conf/                    # meta-collect.properties 模板
-│  ├─ bin/collect_once.sh      # 单轮编排（flock 防重入 + 游标推进 + runs 记录）
+│  ├─ bin/collect_once.sh      # 单轮编排（flock 防重入 + runs 记录；渲染 SQL 默认保留 3 天自动清理）
 │  └─ README.md                # 链路、部署步骤、幂等与重放语义
 └─ README.md（本文件）
 ```

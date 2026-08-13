@@ -1,5 +1,10 @@
 # Paimon 元数据采集器 — 本地开发指导
 
+> **⚠️ 已退役（2026-08-11）**：本采集器已停止在现场部署运行，不再产生新数据
+> （`RDW_ODS_FLINK_METRICS` 中 job_name='wide_table' 的 `paimon.*` 指标仅有历史数据）。
+> 代码保留、可构建可测试；表侧观测改由 `scripts/meta-collect/`（行级元数据 ODS）承担，
+> analysis-sql 的 02/05/08 已改接该通路。本文档以下内容为历史开发参考。
+
 > 组件 c：周期读取 Paimon 表元数据（文件数 / 各 Level 数据量 / Compaction 信息 / 快照号与时间），
 > 封装为统一指标信封发往既有 Kafka metrics topic，由既有 Flink→StarRocks 链路落表。
 

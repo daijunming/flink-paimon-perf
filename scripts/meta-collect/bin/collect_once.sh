@@ -18,6 +18,8 @@
 # crontab 示例(每 3 分钟):
 #   */3 * * * * bash /path/to/scripts/meta-collect/bin/collect_once.sh /path/to/meta-collect.properties >> /path/to/logs/meta-collect.log 2>&1
 # 注意:Kerberos 环境请保证 cron 用户持有有效 ticket(或用 kinit -kt 包装本脚本)。
+# 产物:渲染后的 SQL 落 state/rendered/(供复核),每轮开头自动清理超期文件,
+#      默认保留 3 天(RENDERED_RETENTION_DAYS 可调);清理失败不影响采集。
 
 set -euo pipefail
 
@@ -29,6 +31,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TPL_DIR="${SCRIPT_DIR}/../flink-sql"
 WORK_DIR="${WORK_DIR:-${SCRIPT_DIR}/../state}"
 mkdir -p "${WORK_DIR}/rendered"
+
+# rendered SQL 超期清理(保留期供复核;失败放行,不因清理影响采集)
+find "${WORK_DIR}/rendered" -name '*.sql' -mtime +"${RENDERED_RETENTION_DAYS:-3}" -delete 2>/dev/null || true
 
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 

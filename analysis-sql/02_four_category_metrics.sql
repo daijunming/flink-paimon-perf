@@ -2,20 +2,30 @@
 -- 按真实作业拓扑对齐（2026-07-07 核对）：写入作业 write-only，Compaction 由独立 action 作业完成。
 --
 -- 关键：Flink 指标是任务级，metric_name = '<算子名>.<subtask下标>.<指标短名>'，按 subtask 分行；
---       要得到作业级总量，必须「每个 subtask 取桶内累计最大值，再对各 subtask 求和」（不是直接 MAX）。
+--       要得到作业级总量，必须「桶内取 MAX → 单算子内跨 subtask 求和 → 跨算子取 MAX 去重」：
+--       同一指标可能被任务级（算子链全名）与算子级（单算子名）两种粒度重复上报、计数相同，
+--       不分算子直接 SUM 会重复计数（2026-08-12 现场核实，见类别1a）。
 --
--- 数据源与 job_name：
+-- 数据源与 job_name（2026-08-11 采集器退役后口径）：
 --   写入作业   job_name='DataStreamperf_paimon'（算子链 Source:...->ConstraintEnforcer[..]->Map / Writer / Global Committer）
---   Compaction job_name='compaction_job'（独立 paimon action 作业）
---   Paimon 表  job_name='wide_table'（元数据采集器）
---   集群资源   job_name='cluster'（YARN/HDFS 采集器）
+--   Compaction job_name='compaction_job'（旧流式常驻形态；现行 crontab 批任务不上报指标，视图仅历史有效）
+--   Paimon 表  改由 meta-collect ODS 承载（rdw_ods_paimon_meta_snapshots 等）——
+--              metadata-collector（job_name='wide_table'）2026-08 退役，paimon.* 指标无新数据
+--   集群资源   resource-collector（job_name='cluster'）2026-08 退役，无替代通路，
+--              原 metrics_resource_compaction 视图随之删除（见下文 4a 说明）
 -- 读取性能（原类别3）：流式读作业（streaming_read_job）已接入，吞吐/反压/读写对照见
 -- 09_streaming_read.sql；本文件不重复产出。点查/批 OLAP 仍无作业，不出对应视图。
 
 -- ==================== 类别1a：写入吞吐（Requirements 7.1）====================
--- 源链路算子（含 ConstraintEnforcer）的 numRecordsOut：每个 subtask（=不同 metric_name）取桶内累计最大值，
--- 再对各 subtask 求和 = 该分钟末作业级累计写出条数；rps 由 03 用相邻桶差分/时段秒数得到。
--- 注意：修正最初样例的 'ConstraintEnforcer%'（前缀）——真实算子名以 'Source:' 开头，须用 '%ConstraintEnforcer%'（包含）。
+-- 源链路算子（含 ConstraintEnforcer）的 numRecordsOut 是累计计数器，聚合三层：
+--   ① 桶内 MAX（≈桶末值）→ ② 单算子内跨 subtask SUM（=该算子看到的作业级累计）→ ③ 跨算子 MAX。
+-- ③ 不可省（2026-08-12 现场核实）：该 LIKE 命中 6 个 metric_name = 2 算子 × 3 subtask——
+--   任务级链名 'Source: kafka_source[3] -> ConstraintEnforcer[4] -> Map' 与算子级名
+--   'ConstraintEnforcer[4]' 是同一条链的两种上报粒度、计数相同；不分算子直接 SUM 会把同一批
+--   记录算两遍（吞吐虚高约 2 倍）。同链两粒度计数近似相等，跨算子 MAX≈真实总量（若
+--   ConstraintEnforcer 丢弃违约记录，MAX 取偏源头侧的值）。
+-- 注意：LIKE 须用 '%ConstraintEnforcer%'（包含）——真实算子名以 'Source:' 开头（旧版前缀
+-- 'ConstraintEnforcer%' 匹配不到任务级链名）。
 CREATE OR REPLACE VIEW RDW_DATA.metrics_ingest_perf AS
 SELECT
   time_bucket_minute,
@@ -28,17 +38,31 @@ SELECT
 FROM (
   SELECT
     time_bucket_minute,
-    SUM(subtask_cum) AS records_out_total          -- 各 subtask 累计求和 = 作业级累计写出条数
+    MAX(op_total) AS records_out_total             -- ③ 跨算子 MAX 去重（两粒度计数相同，不可 SUM）
   FROM (
     SELECT
       time_bucket_minute,
-      metric_name,                                 -- 每个 subtask 一个 metric_name
-      MAX(metric_value) AS subtask_cum             -- 累计计数器：桶内取最大≈桶末值
-    FROM RDW_DATA.metrics_view
-    WHERE job_name = 'DataStreamperf_paimon'
-      AND metric_name LIKE '%ConstraintEnforcer%numRecordsOut'  -- '%numRecordsOut' 天然排除 numRecordsOutPerSecond
-    GROUP BY time_bucket_minute, metric_name
-  ) s
+      operator_name,
+      SUM(subtask_cum) AS op_total                 -- ② 单算子内：各 subtask 累计求和
+    FROM (
+      SELECT
+        time_bucket_minute,
+        -- 剥掉末尾 '<subtask>.numRecordsOut' 得到算子名（两种上报粒度在此分开）
+        REGEXP_REPLACE(metric_name, '\\.[0-9]+\\.numRecordsOut$', '') AS operator_name,
+        subtask_cum
+      FROM (
+        SELECT
+          time_bucket_minute,
+          metric_name,
+          MAX(metric_value) AS subtask_cum         -- ① 累计计数器：桶内取最大≈桶末值
+        FROM RDW_DATA.metrics_view
+        WHERE job_name = 'DataStreamperf_paimon'
+          AND metric_name LIKE '%ConstraintEnforcer%numRecordsOut'  -- '%numRecordsOut' 天然排除 numRecordsOutPerSecond
+        GROUP BY time_bucket_minute, metric_name
+      ) m
+    ) s
+    GROUP BY time_bucket_minute, operator_name
+  ) o
   GROUP BY time_bucket_minute
 ) t;
 
@@ -55,60 +79,26 @@ WHERE job_name = 'DataStreamperf_paimon'
 GROUP BY time_bucket_minute;
 
 -- ==================== 类别2：更新与删除效率（Requirements 7.2）====================
--- Paimon commit kind：COMPACT=1.0 / APPEND=0.0。COMPACT 占比反映 Compaction 活跃度。
+-- 数据源已改接 meta-collect ODS 快照表（2026-08-11）：原信号 paimon.last.commit.kind
+-- 随 metadata-collector 退役无新数据；ODS 快照表逐提交记录 commit_kind 与 commit_time，
+-- 是更准的来源（原口径只采到采集周期内"最后一次 commit kind"，同周期多次提交被覆盖）。
+-- 列名 total_commits / compact_count 保持不变（05_health_flags 直接引用）；
+-- 原 avg_commit_kind（0/1 标志的均值）由 compact_ratio 取代，语义相同。
 CREATE OR REPLACE VIEW RDW_DATA.metrics_update_delete_eff AS
 SELECT
-  time_bucket_minute,
-  AVG(metric_value) AS avg_commit_kind,
-  SUM(CASE WHEN metric_value = 1.0 THEN 1 ELSE 0 END) AS compact_count,
-  COUNT(*) AS total_commits
-FROM RDW_DATA.metrics_view
-WHERE job_name = 'wide_table'
-  AND metric_name = 'paimon.last.commit.kind'
-GROUP BY time_bucket_minute;
+  DATE_FORMAT(commit_time, '%Y-%m-%d %H:%i:00') AS time_bucket_minute,
+  COUNT(*) AS total_commits,
+  SUM(CASE WHEN commit_kind = 'COMPACT' THEN 1 ELSE 0 END) AS compact_count,
+  SUM(CASE WHEN commit_kind = 'COMPACT' THEN 1 ELSE 0 END) / COUNT(*) AS compact_ratio
+FROM RDW_DATA.rdw_ods_paimon_meta_snapshots
+WHERE table_name = 'wide_table'
+GROUP BY DATE_FORMAT(commit_time, '%Y-%m-%d %H:%i:00');
 
--- ==================== 类别4a：集群资源 + Paimon 文件/Level（Requirements 7.4）====================
--- YARN/HDFS 来自 job_name='cluster'（资源采集器）；Paimon 文件数/Level 来自 job_name='wide_table'。
--- 这些都是每类每时段单序列，直接 MAX 即可（非 subtask 分行）。
-CREATE OR REPLACE VIEW RDW_DATA.metrics_resource_compaction AS
-SELECT
-  time_bucket_minute,
-  -- YARN（cluster 级）
-  MAX(CASE WHEN metric_name = 'yarn.allocated.vcores'    THEN metric_value END) AS yarn_allocated_vcores,
-  MAX(CASE WHEN metric_name = 'yarn.available.vcores'    THEN metric_value END) AS yarn_available_vcores,
-  MAX(CASE WHEN metric_name = 'yarn.allocated.memory.mb' THEN metric_value END) AS yarn_allocated_memory_mb,
-  MAX(CASE WHEN metric_name = 'yarn.available.memory.mb' THEN metric_value END) AS yarn_available_memory_mb,
-  -- HDFS（cluster 级）
-  MAX(CASE WHEN metric_name = 'hdfs.capacity.used.bytes'      THEN metric_value END) AS hdfs_used_bytes,
-  MAX(CASE WHEN metric_name = 'hdfs.capacity.total.bytes'     THEN metric_value END) AS hdfs_total_bytes,
-  MAX(CASE WHEN metric_name = 'hdfs.capacity.remaining.bytes' THEN metric_value END) AS hdfs_remaining_bytes,
-  -- Paimon 文件总数 + Level 分布（L0 堆积 = Compaction 跟不上写入）
-  MAX(CASE WHEN metric_name = 'paimon.file.count' THEN metric_value END) AS paimon_file_count,
-  MAX(CASE WHEN metric_name = 'paimon.level.file.count.L0' THEN metric_value END) AS level0_file_count,
-  MAX(CASE WHEN metric_name = 'paimon.level.file.count.L1' THEN metric_value END) AS level1_file_count,
-  MAX(CASE WHEN metric_name = 'paimon.level.file.count.L2' THEN metric_value END) AS level2_file_count,
-  MAX(CASE WHEN metric_name = 'paimon.level.file.count.L3' THEN metric_value END) AS level3_file_count,
-  MAX(CASE WHEN metric_name = 'paimon.level.file.count.L4' THEN metric_value END) AS level4_file_count,
-  MAX(CASE WHEN metric_name = 'paimon.level.file.count.L5' THEN metric_value END) AS level5_file_count,
-  MAX(CASE WHEN metric_name = 'paimon.level.size.bytes.L0' THEN metric_value END) AS level0_size_bytes,
-  MAX(CASE WHEN metric_name = 'paimon.level.size.bytes.L1' THEN metric_value END) AS level1_size_bytes,
-  MAX(CASE WHEN metric_name = 'paimon.level.size.bytes.L2' THEN metric_value END) AS level2_size_bytes,
-  MAX(CASE WHEN metric_name = 'paimon.level.size.bytes.L3' THEN metric_value END) AS level3_size_bytes,
-  MAX(CASE WHEN metric_name = 'paimon.level.size.bytes.L4' THEN metric_value END) AS level4_size_bytes,
-  MAX(CASE WHEN metric_name = 'paimon.level.size.bytes.L5' THEN metric_value END) AS level5_size_bytes
-FROM RDW_DATA.metrics_view
-WHERE (job_name = 'cluster'
-        AND metric_name IN ('yarn.allocated.vcores', 'yarn.available.vcores',
-                            'yarn.allocated.memory.mb', 'yarn.available.memory.mb',
-                            'hdfs.capacity.used.bytes', 'hdfs.capacity.total.bytes',
-                            'hdfs.capacity.remaining.bytes'))
-   OR (job_name = 'wide_table'
-        AND metric_name IN ('paimon.file.count',
-                            'paimon.level.file.count.L0', 'paimon.level.file.count.L1', 'paimon.level.file.count.L2',
-                            'paimon.level.file.count.L3', 'paimon.level.file.count.L4', 'paimon.level.file.count.L5',
-                            'paimon.level.size.bytes.L0', 'paimon.level.size.bytes.L1', 'paimon.level.size.bytes.L2',
-                            'paimon.level.size.bytes.L3', 'paimon.level.size.bytes.L4', 'paimon.level.size.bytes.L5'))
-GROUP BY time_bucket_minute;
+-- ==================== 类别4a：集群资源 + Paimon 文件/Level —— 已删除 ====================
+-- 原 metrics_resource_compaction 视图已删除（2026-08-11）：
+--   * yarn.*/hdfs.* 信号随 resource-collector 退役，无替代通路，资源观测随之退役；
+--   * Paimon 文件数/Level 分布由 meta-collect 的 RDW_DATA.v_paimon_meta_level_stats 覆盖
+--    （逐 Snapshot 粒度，比原聚合指标更准），此处不再重复建视图。
 
 -- ==================== 类别4b：Compaction 作业开销（Requirements 7.4）====================
 -- 注意：现行合并为 crontab 批任务 paimon-compact（几十秒退出），不上报指标，本视图无数据属预期；
@@ -132,7 +122,7 @@ WHERE job_name = 'compaction_job'
 GROUP BY time_bucket_minute;
 
 -- 说明：
--- 1. 写入吞吐/ compaction 吞吐都做了「subtask 求和」——这是任务级指标的正确聚合方式。
--- 2. 类别1 来自写入作业，类别4 的 Compaction 开销来自独立 compaction 作业 + 集群资源 + Paimon 文件/Level。
--- 3. 无读作业，故不产出"读取性能"视图。
+-- 1. 写入吞吐做了「桶内 MAX → 单算子内跨 subtask 求和 → 跨算子 MAX 去重」——任务级指标的正确聚合方式（去重不可省，见类别1a）。
+-- 2. 类别1 来自写入作业；类别2 来自 meta-collect ODS 快照表；类别4 仅剩 Compaction 开销视图（仅历史有效）。
+-- 3. 读取性能由 09_streaming_read.sql 产出，本文件不重复建视图。
 -- 4. 查询这些视图时建议在 time_bucket_minute 上加时间范围过滤以利分区裁剪。

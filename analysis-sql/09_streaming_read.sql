@@ -5,7 +5,10 @@
 --
 -- 指标形态与写入作业相同：任务级 '<算子名>.<subtask下标>.<指标短名>'，按 subtask 分行，
 -- 经既有 Flink 链路上报（每 3 分钟一批）。因此吞吐同样用
--- 「桶内 MAX → 跨 subtask SUM → 相邻桶差分/实际间隔秒」（不写死 60，兼容 3 分钟上报与采样缺口）。
+-- 「桶内 MAX → 单算子内跨 subtask SUM → 跨算子 MAX 去重 → 相邻桶差分/实际间隔秒」
+-- （不写死 60，兼容 3 分钟上报与采样缺口）。跨算子去重防任务级链名/算子级名双粒度重复
+-- 上报（写入作业已现场核实存在，见 02 类别1a；读作业是否存在同形态见下方"确认上报"，
+-- 单粒度下 MAX 去重结果不变，属安全兜底）。
 --
 -- 视图：
 --   1) metrics_streaming_read —— 流读吞吐 + Source 反压/繁忙 + 软标志（阈值来自指标地图场景3）
@@ -21,6 +24,9 @@
 --   SELECT DISTINCT metric_name FROM RDW_DATA.RDW_ODS_FLINK_METRICS
 --   WHERE job_name = 'streaming_read_job' AND etl_dt = '<最新分区日期>';
 --   预期命中 'Source: ...%numRecordsOut' 与 '%backPressuredTimeMsPerSecond'。
+--   若 '%Source%numRecordsOut' 剥掉 '<subtask>.numRecordsOut' 后缀后剩多种算子名
+--   = 任务级/算子级双粒度重复上报（写入作业已核实存在该形态，见 02 类别1a）：
+--   视图已按算子名收敛取 MAX 去重，不受影响。
 
 -- ==================== 视图1：流读吞吐 + Source 反压 ====================
 CREATE OR REPLACE VIEW RDW_DATA.metrics_streaming_read AS
@@ -30,7 +36,7 @@ WITH buckets AS (
   WHERE job_name = 'streaming_read_job'
 ),
 tp AS (
-  -- 吞吐：Source 算子 numRecordsOut 是累计计数器，按 subtask 分行
+  -- 吞吐：Source 算子 numRecordsOut 是累计计数器，三层聚合（①桶内MAX→②单算子内跨subtask SUM→③跨算子MAX去重）
   SELECT
     time_bucket_minute,
     records_out_total,
@@ -42,17 +48,31 @@ tp AS (
   FROM (
     SELECT
       time_bucket_minute,
-      SUM(subtask_cum) AS records_out_total      -- 各 subtask 累计求和 = 作业级累计读取条数
+      MAX(op_total) AS records_out_total           -- ③ 跨算子 MAX 去重（双粒度计数相同，不可 SUM）
     FROM (
       SELECT
         time_bucket_minute,
-        metric_name,                             -- 每个 subtask 一个 metric_name
-        MAX(metric_value) AS subtask_cum         -- 累计计数器：桶内取最大≈桶末值
-      FROM RDW_DATA.metrics_view
-      WHERE job_name = 'streaming_read_job'
-        AND metric_name LIKE '%Source%numRecordsOut'  -- 结尾非 PerSecond，天然排除速率指标
-      GROUP BY time_bucket_minute, metric_name
-    ) s
+        operator_name,
+        SUM(subtask_cum) AS op_total               -- ② 单算子内：各 subtask 累计求和
+      FROM (
+        SELECT
+          time_bucket_minute,
+          -- 剥掉末尾 '<subtask>.numRecordsOut' 得到算子名（两种上报粒度在此分开）
+          REGEXP_REPLACE(metric_name, '\\.[0-9]+\\.numRecordsOut$', '') AS operator_name,
+          subtask_cum
+        FROM (
+          SELECT
+            time_bucket_minute,
+            metric_name,
+            MAX(metric_value) AS subtask_cum       -- ① 累计计数器：桶内取最大≈桶末值
+          FROM RDW_DATA.metrics_view
+          WHERE job_name = 'streaming_read_job'
+            AND metric_name LIKE '%Source%numRecordsOut'  -- 结尾非 PerSecond，天然排除速率指标
+          GROUP BY time_bucket_minute, metric_name
+        ) m
+      ) s
+      GROUP BY time_bucket_minute, operator_name
+    ) o
     GROUP BY time_bucket_minute
   ) t
 ),
@@ -112,7 +132,7 @@ LEFT JOIN RDW_DATA.metrics_streaming_read r
   ON w.time_bucket_minute = r.time_bucket_minute;
 
 -- 说明：
--- 1. 与写入侧一致的「subtask 求和 + 实际秒差分」是本任务级指标的正确聚合方式；3 分钟上报下
+-- 1. 与写入侧一致的「单算子内 subtask 求和 + 跨算子 MAX 去重 + 实际秒差分」是本任务级指标的正确聚合方式；3 分钟上报下
 --    本视图每 3 分钟一行有效数据，read_rps 是该窗口的平均速率（数值正确，时间分辨率=上报周期）。
 -- 2. LAGGING 持续出现 且 unconsumed_records 持续扩大 = 消费跟不上写入；结合
 --    read_backpressure_flag（读侧反压）与 08 的 STALL（快照停滞）定位"读不动"还是"没新数据"。
