@@ -30,6 +30,8 @@ TOPIC_BUCKETS=rdw_ods_paimon_meta_buckets
 TOPIC_CONSUMERS=rdw_ods_paimon_meta_consumers
 TOPIC_OPTIONS=rdw_ods_paimon_meta_options
 TOPIC_RUNS=rdw_ods_paimon_meta_collect_runs
+# 物理维度(collect_physical.sh 用;非系统表,HDFS du/ls 采集)
+TOPIC_PHYSICAL=rdw_ods_paimon_meta_physical
 
 # ==================== Flink 提交通道(必填)====================
 # sql-client 路径(默认提交通道;若平台支持 batch SQL 作业,可改为包装平台提交命令的脚本,

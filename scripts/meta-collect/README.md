@@ -46,10 +46,14 @@ crontab(*/3分钟)
        │                          + partitions/buckets 由 $files 聚合(单作业 6 条 INSERT)
        ├─ 20_collect_sampling   → Kafka:$consumers + $options 按时间采样
        └─ collect_runs 记录     → Kafka(kafka-console-producer)
+
+crontab(*/10分钟)
+  └─ bin/collect_physical.sh   → Kafka:HDFS 物理事实(du 总占用 / data-* / changelog-* /
+                                 其余分类统计;changelog 文件系统表采不到,只有这条路)
                                      ↓
-                        StarRocks Routine Load(03_routine_load.sql)
+                        StarRocks Routine Load(03_routine_load.sql + 04_physical_ods.sql)
                                      ↓
-              RDW_DATA: rdw_ods_paimon_meta_*(9 张 PRIMARY KEY 表)
+              RDW_DATA: rdw_ods_paimon_meta_*(10 张 PRIMARY KEY 表)
                                      ↓
               分析层视图(02):level_stats / file_size_stats
 ```
@@ -57,7 +61,7 @@ crontab(*/3分钟)
 **topic 名与 SR 表名一一对应**(`rdw_ods_paimon_meta_*`),按元表类型分、不按业务表分;
 消息中带 catalog/database/table 标识,新增被监控表无需新建 topic 和 SR 表。
 
-## ODS 表四类职责
+## ODS 表五类职责
 
 | 类别 | 包含表 | 主要回答的问题 |
 |------|--------|----------------|
@@ -65,6 +69,7 @@ crontab(*/3分钟)
 | 存储组织事实 | `files`、`manifests`、`partitions`、`buckets` | 当前数据由哪些文件组成,分布在哪些 Bucket 和 Level,文件组织如何变化? |
 | 消费运行状态 | `consumers` | 各消费作业消费到哪里,是否出现滞后或停滞? |
 | 配置与采集依据 | `options`、`collect_runs` | 表使用什么配置,采集结果是否完整可信? |
+| 物理占用事实 | `physical` | 表目录真实占用多少、changelog 文件堆了多少、物理文件与 $files 当前态差多少? |
 
 各表详细职责见 `sr/01_ods_tables.sql` 的表级 COMMENT。
 
@@ -75,7 +80,8 @@ scripts/meta-collect/
 ├─ sr/
 │  ├─ 01_ods_tables.sql               # 9 张 PRIMARY KEY ODS 表(先执行)
 │  ├─ 02_analysis_views.sql           # 分析层视图(查询时计算,不落存储)
-│  └─ 03_routine_load.sql             # 9 条 Routine Load(执行前替换 ${...})
+│  ├─ 03_routine_load.sql             # 9 条 Routine Load(执行前替换 ${...})
+│  └─ 04_physical_ods.sql             # 物理维度表 + Routine Load(独立执行,对应 collect_physical.sh)
 ├─ flink-sql/
 │  ├─ 10_collect_main.sql.tpl         # 主采集(单作业 6 条 INSERT)
 │  └─ 20_collect_sampling.sql.tpl     # consumers + options 按时间采样
@@ -83,18 +89,23 @@ scripts/meta-collect/
 ├─ bin/collect_once.sh                # 单轮编排:渲染模板 → 提交 → 记 runs
 │   (运行期生成 state/rendered/*.sql:渲染产物供复核,默认保留 3 天自动清理,
 │     RENDERED_RETENTION_DAYS 可调)
+├─ bin/collect_physical.sh            # 物理维度采集:HDFS du/ls → Kafka(建议 */10 分钟)
 └─ README.md(本文件)
 ```
 
 ## 部署步骤(离线集群)
 
 1. StarRocks 侧:`SOURCE sr/01_ods_tables.sql;` → `SOURCE sr/02_analysis_views.sql;`
-   → 替换占位符后执行 `sr/03_routine_load.sql`(若走既有 Flink 入库链路则跳过,按列名映射)。
-2. Kafka 侧:建 9 个 topic(`rdw_ods_paimon_meta_*`),分区数 3 即可,数据量很小。
+   → 替换占位符后执行 `sr/03_routine_load.sql`(若走既有 Flink 入库链路则跳过,按列名映射);
+   物理维度另执行 `sr/04_physical_ods.sql`(独立于 01,随时可补建)。
+2. Kafka 侧:建 10 个 topic(`rdw_ods_paimon_meta_*`),分区数 3 即可,数据量很小
+   (physical 每轮一行,1 分区也够)。
 3. 复制 `conf/meta-collect.properties.template` 为 `meta-collect.properties` 并填值。
 4. 冒烟一轮:`bash bin/collect_once.sh /path/to/meta-collect.properties`,
    看日志、SR 表行数、`SHOW ROUTINE LOAD` 状态。
-5. 挂 crontab:`*/3 * * * * bash .../bin/collect_once.sh /path/to/meta-collect.properties >> .../meta-collect.log 2>&1`
+5. 挂 crontab:`*/3 * * * * bash .../bin/collect_once.sh /path/to/meta-collect.properties >> .../meta-collect.log 2>&1`;
+   物理采集另挂 `*/10 * * * * bash .../bin/collect_physical.sh /path/to/meta-collect.properties >> .../meta-physical.log 2>&1`
+   (复用同一份 properties,需含 TOPIC_PHYSICAL)。
 
 ## 幂等与历史语义
 
@@ -122,6 +133,10 @@ scripts/meta-collect/
 - 环境前提:sql-client 能提交 batch 作业(或平台支持 batch SQL);cron 用户持有有效
   Kerberos ticket。每轮 2 个小型 YARN 批作业(单作业 10-30s 量级),
   若 3 分钟周期太紧,放宽到 5 分钟与 compact 周期对齐也不丢信息。
+- 物理维度(collect_physical.sh)按 Paimon 文件名前缀分类(data-*/changelog-*/其余),
+  依赖 FileStorePathFactory 命名约定;data_bytes 是物理存在口径(含快照窗口旧文件与
+  孤儿文件),与 $files 当前态的差值=历史包袱,拆解在分析层。ls -R 开销随表文件数增长,
+  周期建议 ≥10 分钟,勿套用主链路的 3 分钟。
 
 ## 分析示例(分析层口径,ODS 只提供事实)
 

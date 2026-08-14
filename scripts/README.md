@@ -26,6 +26,7 @@ scripts/
 │  ├─ flink-sql/               # 采集 SQL 模板（00 latest / 10 主采集 / 20 consumers）
 │  ├─ conf/                    # meta-collect.properties 模板
 │  ├─ bin/collect_once.sh      # 单轮编排（flock 防重入 + runs 记录；渲染 SQL 默认保留 3 天自动清理）
+│  ├─ bin/collect_physical.sh  # 物理维度采集（HDFS du/ls → Kafka；目录占用/changelog 文件，建议 */10 分钟）
 │  └─ README.md                # 链路、部署步骤、幂等与重放语义
 └─ README.md（本文件）
 ```
