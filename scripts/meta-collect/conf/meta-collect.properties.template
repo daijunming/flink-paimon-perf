@@ -33,6 +33,10 @@ TOPIC_RUNS=rdw_ods_paimon_meta_collect_runs
 # 物理维度(collect_physical.sh 用;非系统表,HDFS du/ls 采集)
 TOPIC_PHYSICAL=rdw_ods_paimon_meta_physical
 
+# Kafka topic 位移采集(collect_kafka_offsets.sh 用):逗号/空格分隔的被监控 topic 列表
+KAFKA_OFFSET_TOPICS=src_pref_paimon
+TOPIC_OFFSETS=rdw_ods_kafka_topic_offsets
+
 # ==================== Flink 提交通道(必填)====================
 # sql-client 路径(默认提交通道;若平台支持 batch SQL 作业,可改为包装平台提交命令的脚本,
 # 只要保持"<命令> [opts] -f <sql文件>"的调用约定即可)

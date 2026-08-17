@@ -52,7 +52,9 @@ Maven 多模块工程（根 `pom.xml`，groupId `com.paimonperf`，packaging `po
   原与 metadata-collector **并存**（聚合指标通路 vs 行级历史通路）；后者 2026-08-11 退役后，
   本目录成为唯一表侧元数据通路（analysis-sql 02/05/08 的表侧信号已改接这里）。
   物理维度（表目录真实占用/changelog 文件数，系统表采不到）由 `bin/collect_physical.sh`
-  经 HDFS du/ls 采集，同走 Kafka→ODS（`rdw_ods_paimon_meta_physical`）。详见其 README.md。
+  经 HDFS du/ls 采集，同走 Kafka→ODS（`rdw_ods_paimon_meta_physical`）；Kafka topic 生产速率
+  由 `bin/collect_kafka_offsets.sh` 采分区末端位移、分析层视图差分
+  （`rdw_ods_kafka_topic_offsets` / `v_kafka_topic_write_rate`）。详见其 README.md。
 - `docs/` — 需求、设计、验证文档（中文）。
 - `.kiro/` — 可移植的 AI 协作护栏**模板套件**（steering toolkit），非本项目的活跃 steering，
   不会被自动加载；其中 `git-commit-language.md` 描述了本仓库沿用的提交信息口径。

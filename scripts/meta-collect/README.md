@@ -50,12 +50,15 @@ crontab(*/3分钟)
 crontab(*/10分钟)
   └─ bin/collect_physical.sh   → Kafka:HDFS 物理事实(du 总占用 / data-* / changelog-* /
                                  其余分类统计;changelog 文件系统表采不到,只有这条路)
+
+crontab(*/1分钟)
+  └─ bin/collect_kafka_offsets.sh → Kafka:topic 分区末端位移(生产速率由分析层视图差分)
                                      ↓
-                        StarRocks Routine Load(03_routine_load.sql + 04_physical_ods.sql)
+                  StarRocks Routine Load(03_routine_load.sql / 04 / 05)
                                      ↓
-              RDW_DATA: rdw_ods_paimon_meta_*(10 张 PRIMARY KEY 表)
+      RDW_DATA: rdw_ods_paimon_meta_*(10 张)+ rdw_ods_kafka_topic_offsets(均 PRIMARY KEY)
                                      ↓
-              分析层视图(02):level_stats / file_size_stats
+              分析层视图(02):level_stats / file_size_stats;(05):v_kafka_topic_write_rate
 ```
 
 **topic 名与 SR 表名一一对应**(`rdw_ods_paimon_meta_*`),按元表类型分、不按业务表分;
@@ -81,7 +84,8 @@ scripts/meta-collect/
 │  ├─ 01_ods_tables.sql               # 9 张 PRIMARY KEY ODS 表(先执行)
 │  ├─ 02_analysis_views.sql           # 分析层视图(查询时计算,不落存储)
 │  ├─ 03_routine_load.sql             # 9 条 Routine Load(执行前替换 ${...})
-│  └─ 04_physical_ods.sql             # 物理维度表 + Routine Load(独立执行,对应 collect_physical.sh)
+│  ├─ 04_physical_ods.sql             # 物理维度表 + Routine Load(独立执行,对应 collect_physical.sh)
+│  └─ 05_kafka_offsets_ods.sql        # topic 位移表 + Routine Load + 速率视图(对应 collect_kafka_offsets.sh)
 ├─ flink-sql/
 │  ├─ 10_collect_main.sql.tpl         # 主采集(单作业 6 条 INSERT)
 │  └─ 20_collect_sampling.sql.tpl     # consumers + options 按时间采样
@@ -90,6 +94,7 @@ scripts/meta-collect/
 │   (运行期生成 state/rendered/*.sql:渲染产物供复核,默认保留 3 天自动清理,
 │     RENDERED_RETENTION_DAYS 可调)
 ├─ bin/collect_physical.sh            # 物理维度采集:HDFS du/ls → Kafka(建议 */10 分钟)
+├─ bin/collect_kafka_offsets.sh       # Kafka topic 位移采集(建议 */1 分钟,速率由分析层差分)
 └─ README.md(本文件)
 ```
 
@@ -97,15 +102,17 @@ scripts/meta-collect/
 
 1. StarRocks 侧:`SOURCE sr/01_ods_tables.sql;` → `SOURCE sr/02_analysis_views.sql;`
    → 替换占位符后执行 `sr/03_routine_load.sql`(若走既有 Flink 入库链路则跳过,按列名映射);
-   物理维度另执行 `sr/04_physical_ods.sql`(独立于 01,随时可补建)。
-2. Kafka 侧:建 10 个 topic(`rdw_ods_paimon_meta_*`),分区数 3 即可,数据量很小
-   (physical 每轮一行,1 分区也够)。
+   物理维度另执行 `sr/04_physical_ods.sql`,topic 位移另执行 `sr/05_kafka_offsets_ods.sql`
+   (两者独立于 01,随时可补建)。
+2. Kafka 侧:建 10 个 `rdw_ods_paimon_meta_*` topic;启用位移采集再加 1 个
+   `rdw_ods_kafka_topic_offsets`。分区数 3 即可,数据量很小(physical/offsets 每轮各几行)。
 3. 复制 `conf/meta-collect.properties.template` 为 `meta-collect.properties` 并填值。
 4. 冒烟一轮:`bash bin/collect_once.sh /path/to/meta-collect.properties`,
    看日志、SR 表行数、`SHOW ROUTINE LOAD` 状态。
 5. 挂 crontab:`*/3 * * * * bash .../bin/collect_once.sh /path/to/meta-collect.properties >> .../meta-collect.log 2>&1`;
-   物理采集另挂 `*/10 * * * * bash .../bin/collect_physical.sh /path/to/meta-collect.properties >> .../meta-physical.log 2>&1`
-   (复用同一份 properties,需含 TOPIC_PHYSICAL)。
+   物理采集另挂 `*/10 * * * * bash .../bin/collect_physical.sh /path/to/meta-collect.properties >> .../meta-physical.log 2>&1`;
+   位移采集另挂 `*/1 * * * * bash .../bin/collect_kafka_offsets.sh /path/to/meta-collect.properties >> .../kafka-offsets.log 2>&1`
+   (后两者复用同一份 properties,需含 TOPIC_PHYSICAL / KAFKA_OFFSET_TOPICS / TOPIC_OFFSETS)。
 
 ## 幂等与历史语义
 
@@ -137,6 +144,10 @@ scripts/meta-collect/
   依赖 FileStorePathFactory 命名约定;data_bytes 是物理存在口径(含快照窗口旧文件与
   孤儿文件),与 $files 当前态的差值=历史包袱,拆解在分析层。ls -R 开销随表文件数增长,
   周期建议 ≥10 分钟,勿套用主链路的 3 分钟。
+- 位移采集(collect_kafka_offsets.sh)只存各分区 latest offset 原始事实;速率由
+  v_kafka_topic_write_rate 相邻采样差分/实际间隔秒得到,漏轮自动按实际间隔归一,
+  但分区扩缩容会造成单点跳变(属真实事件)。GetOffsetShell 老版本无 --command-config
+  时需改用 KAFKA_OPTS 挂 JAAS(见脚本头注释)。
 
 ## 分析示例(分析层口径,ODS 只提供事实)
 
